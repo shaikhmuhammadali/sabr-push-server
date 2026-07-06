@@ -1,0 +1,12 @@
+# One-click deploy blueprint for Render (https://render.com)
+# Nothing to configure: the server generates and persists its own VAPID push keys
+# on first boot, and /tts voice needs no keys at all.
+services:
+  - type: web
+    name: sabr-push-server
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /health
+    autoDeploy: true
