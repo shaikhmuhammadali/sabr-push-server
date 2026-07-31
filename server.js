@@ -36,11 +36,24 @@ const googleTTS = require('google-tts-api');
 let alertTelegram = async () => {};
 try { ({ alertTelegram } = require('./alert')); } catch (_) { /* telegram alerts optional */ }
 
-// ── optional email (for "email me a reset code") ──────────────────────────────
-// Activates only if nodemailer is installed AND SMTP_* env vars are set. Without it, the
-// security-question recovery still works; the email option simply reports it's not configured.
+// ── email (for "email me a reset code") ───────────────────────────────────────
+// Two transports, tried in priority order:
+//   1. Brevo HTTPS API (BREVO_API_KEY) — sends over port 443, so it works even on hosts
+//      that block outbound SMTP. Render's free tier blocks ports 25/465/587, which makes
+//      a direct Gmail/SMTP connection time out; this path sidesteps that entirely.
+//   2. SMTP via nodemailer (SMTP_* env) — used when Brevo isn't set and the host DOES allow
+//      SMTP (a paid Render instance, or self-hosting).
+// With neither configured, the email-reset routes report they're not set up (the app still
+// works fully offline/on-device; only the "email me a code" convenience is unavailable).
+const BREVO_API_KEY = process.env.BREVO_API_KEY || '';
 let mailer = null;
 const MAIL_FROM = process.env.MAIL_FROM || process.env.SMTP_USER || '';
+// Split a `"Name" <email>` (or a bare `email`) MAIL_FROM into the parts the Brevo API wants.
+const FROM = (() => {
+  const m = /^\s*"?([^"<]*?)"?\s*<([^>]+)>\s*$/.exec(MAIL_FROM);
+  if (m) return { name: (m[1].trim() || 'Sirat Khushu'), email: m[2].trim() };
+  return { name: 'Sirat Khushu', email: MAIL_FROM.trim() };
+})();
 (() => {
   if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS) return;
   try {
@@ -51,10 +64,40 @@ const MAIL_FROM = process.env.MAIL_FROM || process.env.SMTP_USER || '';
       secure: /^(1|true|yes)$/i.test(process.env.SMTP_SECURE || '') || Number(process.env.SMTP_PORT) === 465,
       auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
     });
-    console.log('[mail] SMTP configured — email password reset is ON');
   } catch (e) { console.error('[mail] nodemailer not installed:', e.message); }
 })();
-const MAIL_ENABLED = () => !!mailer;
+const MAIL_ENABLED = () => !!(BREVO_API_KEY && FROM.email) || !!mailer;
+console.log('[mail] ' + (BREVO_API_KEY && FROM.email
+  ? 'Brevo API configured — email password reset is ON (from ' + FROM.email + ')'
+  : mailer ? 'SMTP configured — email password reset is ON'
+  : 'no email transport set — "email me a code" reset is OFF'));
+
+// Send one email (plaintext + optional HTML). Prefers the Brevo HTTPS API, falls back to SMTP.
+// Throws on failure so callers can decide whether that's fatal. Bounded by a 15s timeout so a
+// stalled network surfaces as a clean error instead of hanging the whole HTTP request.
+async function sendMailRaw({ to, subject, text, html }) {
+  if (BREVO_API_KEY && FROM.email) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 15000);
+    try {
+      const res = await fetch('https://api.brevo.com/v3/smtp/email', {
+        method: 'POST',
+        headers: { 'api-key': BREVO_API_KEY, 'content-type': 'application/json', 'accept': 'application/json' },
+        body: JSON.stringify(Object.assign(
+          { sender: FROM, to: [{ email: to }], subject, textContent: text },
+          html ? { htmlContent: html } : {})),
+        signal: ctrl.signal,
+      });
+      if (!res.ok) {
+        const body = await res.text().catch(() => '');
+        throw new Error('Brevo ' + res.status + ': ' + body.slice(0, 300));
+      }
+    } finally { clearTimeout(timer); }
+    return;
+  }
+  if (mailer) { await mailer.sendMail({ from: MAIL_FROM, to, subject, text, html }); return; }
+  throw new Error('no mail transport configured');
+}
 
 const escHtml = (s) => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
@@ -67,8 +110,7 @@ function sendPasswordChangedAlert(u, req) {
     const name = u.username || 'there';
     const when = new Date().toUTCString();
     const ip = (req && (req.ip || (req.headers && req.headers['x-forwarded-for']))) || 'unknown';
-    mailer.sendMail({
-      from: MAIL_FROM,
+    sendMailRaw({
       to: u.email,
       subject: 'Your Sirat Khushu password was changed',
       text:
@@ -434,10 +476,15 @@ app.post('/auth/forgot-email', authLimiter, authGuard, async (req, res) => {
         u.resetCode = { hash: sha256hex(code), exp: now + 15 * 60000, tries: 0, sentAt: now };
         saveUser(uKey);
         try {
-          await mailer.sendMail({
-            from: MAIL_FROM, to: u.email,
+          await sendMailRaw({
+            to: u.email,
             subject: 'Your Sirat Khushu password reset code',
             text: 'Assalamu alaikum,\n\nYour password reset code is: ' + code + '\n\nIt expires in 15 minutes. If you did not request this, you can safely ignore this email.',
+            html: '<div style="font-family:system-ui,Segoe UI,Arial,sans-serif;max-width:480px;margin:0 auto;background:#0a0e14;color:#e9e3d2;border:1px solid rgba(217,180,91,.3);border-radius:16px;padding:26px 24px;text-align:center">' +
+              '<div style="color:#e6c169;font-size:12px;letter-spacing:.22em;text-transform:uppercase;font-weight:700">Password reset</div>' +
+              '<p style="color:#c8c2b0;line-height:1.6;font-size:14px">Assalamu alaikum, use this code to reset your Sirat Khushu password:</p>' +
+              '<div style="font-size:34px;font-weight:800;letter-spacing:.3em;color:#f4ecd8;margin:14px 0;padding:14px;background:rgba(217,180,91,.08);border:1px solid rgba(217,180,91,.25);border-radius:12px">' + code + '</div>' +
+              '<p style="color:#8a94a6;font-size:12px">It expires in 15 minutes. If you didn&rsquo;t request this, you can safely ignore this email.</p></div>',
           });
         } catch (e) { console.error('[mail] send failed:', e.message); return res.status(502).json({ error: 'could not send the email right now — please try again shortly' }); }
       }
