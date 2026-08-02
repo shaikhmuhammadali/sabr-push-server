@@ -1,32 +1,28 @@
 /* ═══════════════════════════════════════════════════════════════════════════
-   Sirat Khushu — Admin portal  (the Django-/admin-style dashboard)
+   Sirat Khushu — Admin portal  (a premium, animated Django-/admin-style dashboard)
 
-   Mounts at /admin. Shows every account on this server, their push
-   subscriptions, storage use and server health, and lets you delete an
-   account, sign a user out everywhere, or export the whole database.
+   Mounts at /admin. Shows every account on this server with a rich, animated
+   per-user deep-dive: prayer completion (per salah + streaks), journal (behind a
+   privacy veil), learning & growth (xp, dhikr, bookmarks, duas, adhkar, badges),
+   password protection status, devices, and server health. You can open a user's
+   detail, view their raw blob, sign them out everywhere, delete them, or export.
 
    SECURITY — read before deploying:
    • FAILS CLOSED. With no ADMIN_KEY set, /admin refuses to serve anything.
-     There is deliberately no default password: an admin panel that is open
-     by default is worse than no admin panel at all.
-   • Set one strong key:   ADMIN_KEY=<long random string>   in your .env
-   • The key is compared with timingSafeEqual, never logged, and never sent
-     back to the browser. The browser gets a random session cookie instead
-     (httpOnly + SameSite=Strict + Secure in production), so the key itself
-     is not sitting in the cookie jar.
-   • Login is rate limited (10 tries / 15 min / IP) to make guessing useless.
+   • Set one strong key:   ADMIN_KEY=<long random string>   in your env.
+   • The key is compared with timingSafeEqual, never logged, never sent back.
+     The browser gets a random httpOnly session cookie instead.
+   • Login is rate limited (10 tries / 15 min / IP).
 
-   PASSWORDS ARE NOT SHOWN — they are not stored. Signup runs
-   crypto.scrypt(password, per-user-salt) and keeps only that one-way hash.
-   Nobody (you, me, or an attacker who steals users.json) can turn it back
-   into the original password. That is the entire point, and it is what
-   SECURITY.md promises your users. The portal shows *that* a password is
-   set and how it is protected — never the password.
+   PASSWORDS ARE NOT SHOWN — they are NOT stored. Signup runs
+   crypto.scrypt(password, per-user salt) and keeps only that one-way hash.
+   Nobody (you, me, or a thief who steals the DB) can turn it back into the
+   original password. The portal shows *that* a password is set and how it is
+   protected — never the password. This is deliberate and non-negotiable.
 
    PRIVACY — the per-user "data" blob holds that person's private journal
-   reflections and prayer history. The portal shows derived COUNTS by
-   default (how many entries, how big). Raw contents stay hidden unless you
-   explicitly open them per-user, and the UI says so out loud.
+   reflections and prayer history. Counts are shown freely; raw journal text is
+   blurred behind a "Privacy veil" you must lift per-entry, and the UI says so.
    ═══════════════════════════════════════════════════════════════════════════ */
 'use strict';
 
@@ -43,6 +39,8 @@ const fmtBytes = (n) => {
   if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
   return (n / 1048576).toFixed(2) + ' MB';
 };
+
+const PRAYERS = ['fajr', 'dhuhr', 'asr', 'maghrib', 'isha'];
 
 /**
  * @param {import('express').Express} app
@@ -65,7 +63,6 @@ function mountAdmin(app, ctx) {
     if (!ADMIN_KEY || typeof provided !== 'string' || !provided) return false;
     const a = Buffer.from(provided);
     const b = Buffer.from(ADMIN_KEY);
-    // compare a fixed-length digest so differing lengths don't throw or leak length
     return crypto.timingSafeEqual(crypto.createHash('sha256').update(a).digest(),
                                   crypto.createHash('sha256').update(b).digest());
   }
@@ -88,7 +85,6 @@ function mountAdmin(app, ctx) {
     if (!exp || exp < Date.now()) { if (sid) sessions.delete(sid); return false; }
     return true;
   }
-  // Every admin route goes through here. Order matters: configured? → logged in?
   function gate(req, res, next) {
     if (!ADMIN_KEY) {
       return res.status(503).type('html').send(page('Admin portal is not enabled', `
@@ -96,9 +92,9 @@ function mountAdmin(app, ctx) {
           <h2>Set an admin key first</h2>
           <p>This portal refuses to run without one — an admin page that is open by
              default would expose every account on this server.</p>
-          <p>Add this to your server's <code>.env</code>, then restart:</p>
+          <p>Add this to your server's environment, then restart:</p>
           <pre>ADMIN_KEY=${esc(crypto.randomBytes(24).toString('base64url'))}</pre>
-          <p class="dim">(That is a freshly generated suggestion — use it, or any long random string.)</p>
+          <p class="dim">(A freshly generated suggestion — use it, or any long random string.)</p>
         </div>`));
     }
     if (!authed(req)) return res.status(401).type('html').send(loginPage());
@@ -106,7 +102,7 @@ function mountAdmin(app, ctx) {
   }
 
   // ── data shaping ───────────────────────────────────────────────────────────
-  // Derive per-user stats WITHOUT exposing private text.
+  // Light per-user stats for the table (no private text).
   function statsFor(u) {
     const out = { bytes: 0, prayerDays: 0, prayerLogs: 0, journal: 0, dhikr: 0, bookmarks: 0, parsed: false };
     if (!u || !u.data) return out;
@@ -124,21 +120,77 @@ function mountAdmin(app, ctx) {
         out.dhikr = Number(d.dhikrTotal) || 0;
         if (Array.isArray(d.bookmarks)) out.bookmarks = d.bookmarks.length;
       }
-    } catch (_) { /* blob unreadable — keep byte size only */ }
+    } catch (_) { /* unreadable — byte size only */ }
     return out;
   }
 
+  // Rich, curated per-user detail for the deep-dive panel. Journal text is included
+  // (the owner explicitly asked to see it) but the UI keeps it behind a privacy veil.
+  function detailFor(key, u) {
+    const det = {
+      key, username: u.username || key, email: u.email || null,
+      createdAt: u.createdAt || null, updatedAt: u.updatedAt || null, rev: u.rev || 0,
+      bytes: u.data ? Buffer.byteLength(u.data) : 0,
+      devices: Object.keys(ctx.accounts.tokens || {}).filter((th) => ctx.accounts.tokens[th] && ctx.accounts.tokens[th].u === key).length,
+      password: {
+        set: !!(u.hash && u.salt), algo: 'scrypt', salted: !!u.salt,
+        recoveryQ: !!u.secAHash,
+        resetPending: !!(u.resetCode && u.resetCode.exp && u.resetCode.exp > Date.now()),
+        fails: Number(u.fails) || 0,
+      },
+      prayer: { days: 0, byName: {}, logged: 0, total: 0, completion: 0, streakBest: 0, recent: [] },
+      learning: { xp: 0, level: 1, dhikr: 0, bookmarks: 0, duas: 0, adhkar: 0, achievements: 0 },
+      journal: [], name: null, city: null, theme: null, method: null,
+    };
+    PRAYERS.forEach((p) => { det.prayer.byName[p] = 0; });
+    let d = null;
+    try { d = u.data ? JSON.parse(u.data) : null; } catch (_) { d = null; }
+    if (d && typeof d === 'object') {
+      if (d.logs && typeof d.logs === 'object') {
+        const days = Object.keys(d.logs);
+        det.prayer.days = days.length;
+        days.forEach((dk) => {
+          const day = d.logs[dk]; if (!day || typeof day !== 'object') return;
+          PRAYERS.forEach((p) => { if (day[p]) { det.prayer.byName[p]++; det.prayer.logged++; } });
+        });
+        det.prayer.total = det.prayer.days * PRAYERS.length;
+        det.prayer.completion = det.prayer.total ? Math.round((det.prayer.logged / det.prayer.total) * 100) : 0;
+        det.prayer.recent = days.sort().slice(-21).map((dk) => {
+          const day = d.logs[dk] || {};
+          return { day: dk, count: PRAYERS.filter((p) => day[p]).length };
+        });
+      }
+      det.prayer.streakBest = Number(d.streakBest) || 0;
+      det.learning.xp = Number(d.xp) || 0;
+      det.learning.level = 1 + Math.floor(det.learning.xp / 100);
+      det.learning.dhikr = Number(d.dhikrTotal) || 0;
+      det.learning.bookmarks = Array.isArray(d.bookmarks) ? d.bookmarks.length : 0;
+      det.learning.duas = Array.isArray(d.duas) ? d.duas.length : 0;
+      det.learning.adhkar = Number(d.adhkarCount) || 0;
+      det.learning.achievements = Array.isArray(d.achievements) ? d.achievements.length
+        : (d.achievements && typeof d.achievements === 'object' ? Object.keys(d.achievements).length : 0);
+      if (Array.isArray(d.journal)) {
+        det.journal = d.journal.slice(0, 200).map((e) => {
+          if (!e || typeof e !== 'object') return { date: null, mood: null, text: String(e || '') };
+          return { date: e.ts || e.d || null, mood: e.mood || null, text: String(e.reflect || e.text || e.entry || '') };
+        });
+      }
+      det.name = (d.profile && d.profile.name) || (d.account && d.account.name) || null;
+      det.city = (d.loc && (d.loc.city || d.loc.name || d.loc.label)) || null;
+      det.theme = d.theme || null;
+      det.method = d.method || null;
+    }
+    return det;
+  }
+
   function subsForEmailless() {
-    // push subscriptions are keyed by endpoint and are not tied to a username,
-    // so we report them as their own table rather than per-user.
     return Object.keys(ctx.subs || {}).map((endpoint) => {
       const s = ctx.subs[endpoint] || {};
       const sched = Array.isArray(s.schedule) ? s.schedule : [];
       let host = '';
       try { host = new URL(endpoint).host; } catch (_) { host = '—'; }
       return {
-        host,
-        endpointTail: endpoint.slice(-12),
+        host, endpointTail: endpoint.slice(-12),
         scheduled: sched.length,
         pending: sched.filter((x) => x && !x.fired).length,
         updatedAt: s.updatedAt || null,
@@ -153,24 +205,17 @@ function mountAdmin(app, ctx) {
       const tokens = Object.keys(ctx.accounts.tokens || {})
         .filter((th) => ctx.accounts.tokens[th] && ctx.accounts.tokens[th].u === key).length;
       return {
-        key,
-        username: u.username || key,
-        email: u.email || null,
-        createdAt: u.createdAt || null,
-        updatedAt: u.updatedAt || null,
-        rev: u.rev || 0,
-        devices: tokens,
-        hasRecoveryQ: Boolean(u.secAHash),
-        pwProtected: Boolean(u.hash && u.salt),
-        stats: st,
+        key, username: u.username || key, email: u.email || null,
+        createdAt: u.createdAt || null, updatedAt: u.updatedAt || null, rev: u.rev || 0,
+        devices: tokens, hasRecoveryQ: Boolean(u.secAHash),
+        pwProtected: Boolean(u.hash && u.salt), stats: st,
       };
     }).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
 
     const totalBytes = users.reduce((n, u) => n + u.stats.bytes, 0);
     const weekAgo = Date.now() - 7 * 86400000;
     return {
-      users,
-      subs: subsForEmailless(),
+      users, subs: subsForEmailless(),
       totals: {
         users: users.length,
         activeWeek: users.filter((u) => (u.updatedAt || 0) > weekAgo).length,
@@ -178,16 +223,15 @@ function mountAdmin(app, ctx) {
         devices: Object.keys(ctx.accounts.tokens || {}).length,
         journal: users.reduce((n, u) => n + u.stats.journal, 0),
         prayerLogs: users.reduce((n, u) => n + u.stats.prayerLogs, 0),
+        dhikr: users.reduce((n, u) => n + u.stats.dhikr, 0),
         bytes: totalBytes,
         subs: Object.keys(ctx.subs || {}).length,
       },
       server: {
         push: Boolean(ctx.PUSH_ENABLED),
         email: typeof ctx.MAIL_ENABLED === 'function' ? Boolean(ctx.MAIL_ENABLED()) : false,
-        usersFile: ctx.USERS_STORE,
-        subsFile: ctx.STORE,
-        uptimeSec: Math.floor(process.uptime()),
-        node: process.version,
+        usersFile: ctx.USERS_STORE, subsFile: ctx.STORE,
+        uptimeSec: Math.floor(process.uptime()), node: process.version,
         now: new Date().toISOString(),
       },
     };
@@ -211,8 +255,15 @@ function mountAdmin(app, ctx) {
   });
 
   app.get('/admin', gate, (req, res) => res.type('html').send(dashboardPage()));
-
   app.get('/admin/api/snapshot', gate, (req, res) => res.json(snapshot()));
+
+  // Curated deep-dive for ONE user (prayer/journal/learning/password status).
+  app.get('/admin/api/user/:key/detail', gate, (req, res) => {
+    const key = String(req.params.key).toLowerCase();
+    const u = ctx.accounts.users[key];
+    if (!u) return res.status(404).json({ error: 'no such user' });
+    res.json(detailFor(key, u));
+  });
 
   // Raw blob for ONE user — deliberately a separate, explicit call.
   app.get('/admin/api/user/:key/raw', gate, (req, res) => {
@@ -223,8 +274,7 @@ function mountAdmin(app, ctx) {
     res.json({ username: u.username, bytes: u.data ? Buffer.byteLength(u.data) : 0, data: parsed });
   });
 
-  // Full export (accounts + subs). Password hashes are stripped: they are useless
-  // to you and a liability in a file that lands in your Downloads folder.
+  // Full export (accounts + subs). Password/recovery hashes stripped.
   app.get('/admin/api/export', gate, (req, res) => {
     const users = {};
     for (const k of Object.keys(ctx.accounts.users)) {
@@ -232,10 +282,6 @@ function mountAdmin(app, ctx) {
       users[k] = { ...u };
       delete users[k].hash; delete users[k].salt;
       delete users[k].secAHash; delete users[k].secASalt;
-      // The pending email-reset secret is stored as u.resetCode = {hash,exp,tries,sentAt}. The old
-      // code deleted resetHash/resetExp — field names that exist NOWHERE — so resetCode.hash (an
-      // unsalted SHA-256 of a 6-digit code, brute-forceable instantly) shipped in the export during
-      // any live reset window. Strip the real object.
       delete users[k].resetCode;
     }
     res.set('Content-Disposition', 'attachment; filename="sirat-khushu-export.json"');
@@ -256,7 +302,6 @@ function mountAdmin(app, ctx) {
   app.post('/admin/api/user/:key/delete', gate, (req, res) => {
     const key = String(req.params.key).toLowerCase();
     if (!ctx.accounts.users[key]) return res.status(404).json({ error: 'no such user' });
-    // require the exact username as confirmation, so a stray click can't erase an account
     if (String((req.body && req.body.confirm) || '').toLowerCase() !== key) {
       return res.status(400).json({ error: 'type the username to confirm' });
     }
@@ -266,8 +311,6 @@ function mountAdmin(app, ctx) {
     res.json({ ok: true });
   });
 
-  // Analytics dashboard (/admin/analytics) — reuses this same session gate, so one login
-  // covers both the accounts table and the usage overview.
   try { require('./admin-analytics').mount(app, gate, ctx); }
   catch (e) { console.error('[admin] analytics mount failed:', e.message); }
 
@@ -276,33 +319,105 @@ function mountAdmin(app, ctx) {
 
 /* ── views ─────────────────────────────────────────────────────────────────── */
 const CSS = `
-:root{--bg:#0b0e14;--bg2:#121724;--line:#222a3a;--text:#e8ecf6;--dim:#8f9ab4;--gold:#d9b45b;--green:#4ec98b;--red:#e2685f}
-*{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font:15px/1.55 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
-a{color:var(--gold)} code,pre{font-family:ui-monospace,Consolas,monospace}
+:root{--bg:#080b12;--bg2:#111726;--bg3:#0c1120;--line:#212a3d;--line2:#2c374e;--text:#eef1fb;--dim:#8b96b2;--gold:#e6c169;--gold2:#d9b45b;--green:#4ec98b;--red:#e2685f;--blue:#6aa8ff;--violet:#a98bff}
+@property --p{syntax:'<number>';inherits:false;initial-value:0}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:radial-gradient(1200px 700px at 80% -10%,#16203a 0,transparent 60%),radial-gradient(900px 600px at -10% 10%,#1a1330 0,transparent 55%),var(--bg);color:var(--text);font:15px/1.55 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;-webkit-font-smoothing:antialiased}
+a{color:var(--gold);text-decoration:none} code,pre{font-family:ui-monospace,Consolas,monospace}
 pre{background:#0a0d14;border:1px solid var(--line);border-radius:10px;padding:12px;overflow:auto;font-size:13px}
-.wrap{max-width:1180px;margin:0 auto;padding:26px 18px 70px}
+.wrap{max-width:1240px;margin:0 auto;padding:26px 18px 80px}
 header{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:22px;flex-wrap:wrap}
-h1{font-size:1.25rem;margin:0;letter-spacing:.02em} h1 small{color:var(--dim);font-weight:400;font-size:.8rem;display:block;margin-top:3px}
-.card{background:var(--bg2);border:1px solid var(--line);border-radius:14px;padding:18px;margin-bottom:16px}
+.brand{display:flex;align-items:center;gap:13px}
+.logo{width:44px;height:44px;border-radius:13px;display:grid;place-items:center;font-size:22px;background:linear-gradient(145deg,#1c2740,#0e1424);border:1px solid var(--line2);box-shadow:0 6px 22px rgba(0,0,0,.45),inset 0 1px 0 rgba(255,255,255,.05);animation:floaty 5s ease-in-out infinite}
+@keyframes floaty{50%{transform:translateY(-4px)}}
+h1{font-size:1.28rem;margin:0;letter-spacing:.02em;background:linear-gradient(90deg,#fff,#e6c169);-webkit-background-clip:text;background-clip:text;color:transparent}
+h1 small{color:var(--dim);font-weight:400;font-size:.76rem;display:block;margin-top:2px;-webkit-text-fill-color:var(--dim)}
+.card{background:linear-gradient(180deg,rgba(255,255,255,.02),transparent),var(--bg2);border:1px solid var(--line);border-radius:16px;padding:20px;margin-bottom:16px;opacity:0;transform:translateY(14px);animation:rise .6s cubic-bezier(.2,.7,.2,1) forwards;box-shadow:0 10px 30px rgba(0,0,0,.25)}
 .card.warn{border-color:#5a4a1e;background:#1a1710}
-h2{font-size:.78rem;letter-spacing:.18em;text-transform:uppercase;color:var(--gold);margin:0 0 14px}
+@keyframes rise{to{opacity:1;transform:none}}
+.card:nth-child(1){animation-delay:.02s}.card:nth-child(2){animation-delay:.08s}.card:nth-child(3){animation-delay:.14s}.card:nth-child(4){animation-delay:.2s}.card:nth-child(5){animation-delay:.26s}
+h2{font-size:.76rem;letter-spacing:.2em;text-transform:uppercase;color:var(--gold);margin:0 0 15px;display:flex;align-items:center;gap:8px}
+h2::before{content:'';width:16px;height:2px;border-radius:2px;background:linear-gradient(90deg,var(--gold),transparent)}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
-.stat{background:#0e1320;border:1px solid var(--line);border-radius:11px;padding:14px}
-.stat b{display:block;font-size:1.5rem;font-variant-numeric:tabular-nums} .stat span{color:var(--dim);font-size:.76rem}
-table{width:100%;border-collapse:collapse;font-size:14px} th,td{text-align:left;padding:10px 9px;border-bottom:1px solid var(--line);vertical-align:middle}
-th{color:var(--dim);font-size:.72rem;letter-spacing:.1em;text-transform:uppercase;font-weight:600}
-tr:last-child td{border-bottom:0} .tblwrap{overflow-x:auto}
-.btn{background:#182034;border:1px solid var(--line);color:var(--text);border-radius:9px;padding:7px 12px;font-size:13px;cursor:pointer}
-.btn:hover{border-color:var(--gold)} .btn.danger{border-color:#5a2a26;color:#ffb3ad} .btn.danger:hover{border-color:var(--red)}
-.pill{display:inline-block;padding:2px 9px;border-radius:999px;font-size:.72rem;border:1px solid var(--line);color:var(--dim)}
-.pill.ok{color:var(--green);border-color:#245c42} .pill.off{color:var(--red);border-color:#5a2a26}
+.stat{position:relative;background:linear-gradient(180deg,#141b2c,#0d1220);border:1px solid var(--line);border-radius:13px;padding:15px 16px;overflow:hidden;transition:transform .25s,border-color .25s,box-shadow .25s}
+.stat:hover{transform:translateY(-3px);border-color:var(--line2);box-shadow:0 12px 26px rgba(0,0,0,.35)}
+.stat::after{content:'';position:absolute;inset:0 0 auto 0;height:2px;background:linear-gradient(90deg,var(--gold),transparent);opacity:.7}
+.stat b{display:block;font-size:1.7rem;font-weight:800;font-variant-numeric:tabular-nums;letter-spacing:-.02em}
+.stat span{color:var(--dim);font-size:.74rem;text-transform:uppercase;letter-spacing:.08em}
+.stat .ic{position:absolute;right:12px;top:12px;font-size:1.1rem;opacity:.5}
+table{width:100%;border-collapse:collapse;font-size:14px} .tblwrap{overflow-x:auto;border-radius:10px}
+th,td{text-align:left;padding:11px 10px;border-bottom:1px solid var(--line);vertical-align:middle}
+th{color:var(--dim);font-size:.7rem;letter-spacing:.11em;text-transform:uppercase;font-weight:600}
+tr.urow{cursor:pointer;transition:background .18s} tr.urow:hover{background:rgba(230,193,105,.05)}
+tr.urow.open{background:rgba(230,193,105,.07)}
+tr:last-child td{border-bottom:0}
+.av{width:34px;height:34px;border-radius:10px;display:inline-grid;place-items:center;font-weight:800;color:#0a0d14;background:linear-gradient(145deg,var(--gold),#b98f3e);font-size:.9rem}
+.uname{display:flex;align-items:center;gap:11px}
+.chev{display:inline-block;transition:transform .3s;color:var(--dim)} tr.urow.open .chev{transform:rotate(90deg);color:var(--gold)}
+.btn{background:#182034;border:1px solid var(--line);color:var(--text);border-radius:9px;padding:7px 12px;font-size:13px;cursor:pointer;transition:.2s}
+.btn:hover{border-color:var(--gold);transform:translateY(-1px)} .btn.danger{border-color:#5a2a26;color:#ffb3ad} .btn.danger:hover{border-color:var(--red)}
+.btn.gold{background:linear-gradient(145deg,var(--gold),#c99f43);color:#0a0d14;border-color:transparent;font-weight:700}
+.pill{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:999px;font-size:.72rem;border:1px solid var(--line);color:var(--dim)}
+.pill.ok{color:var(--green);border-color:#245c42;background:rgba(78,201,139,.08)} .pill.off{color:var(--red);border-color:#5a2a26}
+.pill.warnp{color:var(--gold);border-color:#5a4a1e;background:rgba(230,193,105,.08)}
 .dim{color:var(--dim)} .right{text-align:right} .mono{font-variant-numeric:tabular-nums}
-input[type=password],input[type=text]{background:#0a0d14;border:1px solid var(--line);color:var(--text);border-radius:9px;padding:11px 13px;font-size:15px;width:100%}
-.login{max-width:390px;margin:14vh auto;padding:0 18px}
-.note{background:#0e1320;border-left:3px solid var(--gold);padding:11px 14px;border-radius:0 9px 9px 0;color:var(--dim);font-size:13.5px;margin-bottom:14px}
+input[type=password],input[type=text]{background:#0a0d14;border:1px solid var(--line);color:var(--text);border-radius:10px;padding:12px 14px;font-size:15px;width:100%}
+.login{max-width:400px;margin:13vh auto;padding:0 18px}
+.note{background:linear-gradient(90deg,rgba(230,193,105,.08),transparent);border-left:3px solid var(--gold);padding:12px 15px;border-radius:0 10px 10px 0;color:#cdbd94;font-size:13.5px;margin-bottom:16px}
 .err{color:#ffb3ad;font-size:13.5px;min-height:19px;margin-top:9px}
 .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-details summary{cursor:pointer;color:var(--gold);font-size:13px}
+.acts{display:flex;gap:6px;justify-content:flex-end}
+/* ── detail panel ── */
+.detail td{padding:0;border-bottom:1px solid var(--line)}
+.dwrap{overflow:hidden;max-height:0;transition:max-height .5s cubic-bezier(.2,.7,.2,1)}
+tr.detail.open .dwrap{max-height:1400px}
+.dinner{padding:20px 6px;display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px}
+.panel{background:linear-gradient(180deg,#0f1524,#0a0e1a);border:1px solid var(--line);border-radius:14px;padding:16px 17px;opacity:0;transform:translateY(10px)}
+tr.detail.open .panel{animation:rise .5s ease forwards}
+tr.detail.open .panel:nth-child(2){animation-delay:.06s}tr.detail.open .panel:nth-child(3){animation-delay:.12s}tr.detail.open .panel:nth-child(4){animation-delay:.18s}
+.ptitle{font-size:.7rem;letter-spacing:.14em;text-transform:uppercase;color:var(--dim);margin:0 0 12px;display:flex;align-items:center;gap:7px}
+/* prayer ring */
+.ringwrap{display:flex;align-items:center;gap:16px}
+.ring{--p:0;width:104px;height:104px;flex:0 0 auto;border-radius:50%;display:grid;place-items:center;
+  background:conic-gradient(var(--gold) calc(var(--p)*1%),#1a2233 0);transition:--p 1.1s cubic-bezier(.2,.7,.2,1)}
+.ring::before{content:'';position:absolute;width:78px;height:78px;border-radius:50%;background:var(--bg3);box-shadow:inset 0 2px 8px rgba(0,0,0,.5)}
+.ring b{position:relative;font-size:1.35rem;font-weight:800;font-variant-numeric:tabular-nums}
+.ring i{position:relative;display:block;font-size:.6rem;letter-spacing:.1em;color:var(--dim);font-style:normal;text-align:center}
+.bars{flex:1;display:flex;flex-direction:column;gap:7px;min-width:120px}
+.bar{display:grid;grid-template-columns:64px 1fr 34px;align-items:center;gap:8px;font-size:.78rem}
+.bar .tk{height:8px;border-radius:5px;background:#161d2e;overflow:hidden}
+.bar .tk i{display:block;height:100%;width:0;border-radius:5px;background:linear-gradient(90deg,var(--gold2),var(--gold));transition:width 1s cubic-bezier(.2,.7,.2,1)}
+.bar .vv{text-align:right;color:var(--dim);font-variant-numeric:tabular-nums}
+/* heat strip */
+.heat{display:flex;gap:3px;margin-top:14px;flex-wrap:wrap}
+.heat i{width:13px;height:13px;border-radius:3px;background:#141b2c;border:1px solid #1c2740}
+.heat i.c1{background:#2a3a24}.heat i.c2{background:#3d5c2f}.heat i.c3{background:#4e7a3a}.heat i.c4{background:#5f9a45}.heat i.c5{background:var(--green)}
+/* learning chips */
+.chips{display:grid;grid-template-columns:1fr 1fr;gap:9px}
+.chip{background:#0e1526;border:1px solid var(--line);border-radius:11px;padding:11px 12px}
+.chip b{display:block;font-size:1.25rem;font-weight:800;font-variant-numeric:tabular-nums}
+.chip span{font-size:.68rem;color:var(--dim);text-transform:uppercase;letter-spacing:.06em}
+.chip .em{font-size:.95rem;margin-right:5px}
+.xpbar{height:7px;border-radius:5px;background:#161d2e;margin-top:9px;overflow:hidden}
+.xpbar i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--violet),var(--blue));transition:width 1.1s ease}
+/* password panel */
+.kv{display:flex;justify-content:space-between;gap:10px;padding:7px 0;border-bottom:1px dashed #1c2436;font-size:.86rem}
+.kv:last-child{border-bottom:0} .kv span{color:var(--dim)}
+/* journal */
+.jitem{border:1px solid var(--line);border-radius:11px;padding:11px 13px;margin-bottom:9px;background:#0d1320}
+.jhead{display:flex;justify-content:space-between;align-items:center;gap:8px;font-size:.78rem;color:var(--dim);margin-bottom:7px}
+.jtext{font-size:.9rem;line-height:1.5;transition:filter .35s;color:#dfe4f2}
+.veiled .jtext{filter:blur(6px);user-select:none}
+.reveal{font-size:.68rem;color:var(--gold);cursor:pointer;border:1px solid var(--line);border-radius:7px;padding:2px 8px;background:transparent}
+.mood{font-size:1rem}
+.empty{color:var(--dim);font-size:.86rem;padding:8px 0;font-style:italic}
+.toggle{display:inline-flex;align-items:center;gap:7px;font-size:.74rem;color:var(--dim);cursor:pointer;user-select:none}
+.sw{width:34px;height:19px;border-radius:99px;background:#1c2740;border:1px solid var(--line);position:relative;transition:.25s}
+.sw::after{content:'';position:absolute;top:1px;left:1px;width:15px;height:15px;border-radius:50%;background:var(--dim);transition:.25s}
+.toggle.on .sw{background:rgba(230,193,105,.25);border-color:var(--gold)} .toggle.on .sw::after{left:16px;background:var(--gold)}
+@media (max-width:560px){ .wrap{padding:18px 12px 60px} .acts{justify-content:flex-start} .dinner{grid-template-columns:1fr} .ring{width:92px;height:92px} }
+@media (prefers-reduced-motion:reduce){*{animation-duration:.001s!important;transition-duration:.001s!important}}
 `;
 
 function page(title, body) {
@@ -316,14 +431,15 @@ function page(title, body) {
 function loginPage() {
   return page('Admin', `
   <div class="login">
-    <h1>Sirat Khushu <small>admin portal</small></h1>
-    <div class="card">
+    <div class="brand" style="justify-content:center;margin-bottom:8px"><div class="logo">🌙</div></div>
+    <h1 style="text-align:center">Sirat Khushu <small>admin portal</small></h1>
+    <div class="card" style="margin-top:16px">
       <h2>Sign in</h2>
       <input id="k" type="password" placeholder="Admin key" autofocus autocomplete="current-password">
       <div class="err" id="e"></div>
-      <div style="margin-top:12px"><button class="btn" id="go" style="width:100%;padding:11px">Unlock</button></div>
+      <div style="margin-top:12px"><button class="btn gold" id="go" style="width:100%;padding:12px">Unlock</button></div>
     </div>
-    <p class="dim" style="font-size:12.5px">This is the key from <code>ADMIN_KEY</code> in your server's .env — not any user's password.</p>
+    <p class="dim" style="font-size:12.5px;text-align:center">This is the key from <code>ADMIN_KEY</code> in your server's environment — not any user's password.</p>
   </div>
   <script>
     var k=document.getElementById('k'),e=document.getElementById('e'),go=document.getElementById('go');
@@ -344,20 +460,22 @@ function loginPage() {
 function dashboardPage() {
   return page('Admin', `
   <header>
-    <h1>Sirat Khushu <small>admin portal — every account on this server</small></h1>
+    <div class="brand"><div class="logo">🌙</div>
+      <h1>Sirat Khushu <small>admin portal — every account on this server</small></h1></div>
     <div class="row">
-      <a class="btn" href="/admin/analytics" style="text-decoration:none">📊 Analytics</a>
-      <button class="btn" onclick="location.reload()">Refresh</button>
-      <a class="btn" href="/admin/api/export" style="text-decoration:none">Export JSON</a>
+      <label class="toggle" id="veilT" onclick="toggleVeil()"><span class="sw"></span> Privacy veil</label>
+      <a class="btn" href="/admin/analytics">📊 Analytics</a>
+      <button class="btn" onclick="load()">↻ Refresh</button>
+      <a class="btn" href="/admin/api/export">⭳ Export</a>
       <button class="btn" onclick="logout()">Log out</button>
     </div>
   </header>
 
   <div class="note">
-    <b>Passwords are not shown because they are not stored.</b> Sign-up runs
+    <b>Passwords are never shown — they are not stored.</b> Sign-up runs
     <code>scrypt(password, per-user salt)</code> and keeps only that one-way hash, so nobody — you
-    included — can turn it back into the original password. If someone is locked out, use the
-    app's email reset, or delete and let them re-register.
+    included — can reverse it. Journal reflections are personal; keep the <b>Privacy veil</b> on unless you
+    have a real reason to read them. Click any account row to open its full detail.
   </div>
 
   <div class="card"><h2>Overview</h2><div class="grid" id="stats"></div></div>
@@ -366,46 +484,52 @@ function dashboardPage() {
   <div class="card"><h2>Server</h2><div id="server" class="dim" style="font-size:13.5px"></div></div>
 
 <script>
-var D=null;
+var D=null, VEIL=true, DET={}, OPEN={};
+var PRAYERS=['fajr','dhuhr','asr','maghrib','isha'];
+var PMETA={fajr:['Fajr','🌅'],dhuhr:['Dhuhr','☀️'],asr:['Asr','🌤️'],maghrib:['Maghrib','🌇'],isha:['Isha','🌙']};
 function h(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
 function when(t){ if(!t) return '<span class="dim">—</span>'; var d=new Date(t);
   return d.toLocaleDateString(undefined,{day:'numeric',month:'short',year:'numeric'})+' <span class="dim">'+d.toLocaleTimeString(undefined,{hour:'2-digit',minute:'2-digit'})+'</span>'; }
+function ago(t){ if(!t) return '—'; var s=(Date.now()-t)/1000; if(s<3600) return Math.max(1,Math.floor(s/60))+'m ago'; if(s<86400) return Math.floor(s/3600)+'h ago'; return Math.floor(s/86400)+'d ago'; }
 function bytes(n){ if(!n) return '0 B'; if(n<1024) return n+' B'; if(n<1048576) return (n/1024).toFixed(1)+' KB'; return (n/1048576).toFixed(2)+' MB'; }
+function init(s){ s=String(s||'?').trim(); return (s[0]||'?').toUpperCase(); }
+function countUp(el,to){ to=Number(to)||0; var dur=750,t0=null; function step(ts){ if(!t0)t0=ts; var p=Math.min(1,(ts-t0)/dur); el.textContent=Math.round(to*(1-Math.pow(1-p,3))).toLocaleString(); if(p<1)requestAnimationFrame(step);} requestAnimationFrame(step); }
 
 async function load(){
   var r=await fetch('/admin/api/snapshot'); if(r.status===401){location.reload();return;}
-  D=await r.json();
-  var t=D.totals;
-  document.getElementById('stats').innerHTML=[
-    ['Accounts',t.users],['Active this week',t.activeWeek],['With email',t.withEmail],
-    ['Signed-in devices',t.devices],['Journal entries',t.journal],['Prayers logged',t.prayerLogs],
-    ['Push subscriptions',t.subs],['Data stored',bytes(t.bytes)]
-  ].map(function(s){return '<div class="stat"><b>'+h(s[1])+'</b><span>'+h(s[0])+'</span></div>';}).join('');
+  D=await r.json(); var t=D.totals;
+  var stats=[['Accounts',t.users,'👤'],['Active / week',t.activeWeek,'✨'],['With email',t.withEmail,'✉️'],
+    ['Devices',t.devices,'📱'],['Journal entries',t.journal,'📓'],['Prayers logged',t.prayerLogs,'🕌'],
+    ['Dhikr total',t.dhikr,'📿'],['Data stored',null,'💾']];
+  document.getElementById('stats').innerHTML=stats.map(function(s){
+    return '<div class="stat"><span class="ic">'+s[2]+'</span><b data-c="'+(s[1]==null?'':s[1])+'">'+(s[1]==null?bytes(t.bytes):'0')+'</b><span>'+h(s[0])+'</span></div>';}).join('');
+  document.querySelectorAll('#stats b[data-c]').forEach(function(b){ if(b.getAttribute('data-c')!=='') countUp(b,b.getAttribute('data-c')); });
 
   document.getElementById('users').innerHTML=
-    '<tr><th>User</th><th>Email</th><th>Joined</th><th>Last sync</th><th class="right">Devices</th>'+
-    '<th class="right">Prayers</th><th class="right">Journal</th><th class="right">Size</th><th>Password</th><th></th></tr>'+
-    (D.users.length? D.users.map(function(u){
-      return '<tr>'+
-        '<td><b>'+h(u.username)+'</b></td>'+
+    '<tr><th></th><th>User</th><th>Email</th><th>Joined</th><th>Last active</th><th class="right">Devices</th>'+
+    '<th class="right">Prayers</th><th class="right">Journal</th><th>Password</th><th></th></tr>'+
+    (D.users.length? D.users.map(function(u,i){
+      var open=OPEN[u.key];
+      return '<tr class="urow'+(open?' open':'')+'" data-key="'+h(u.key)+'" onclick="expand(this.dataset.key)">'+
+        '<td><span class="chev">▸</span></td>'+
+        '<td><div class="uname"><span class="av">'+h(init(u.username))+'</span><b>'+h(u.username)+'</b></div></td>'+
         '<td>'+(u.email?h(u.email):'<span class="dim">none</span>')+'</td>'+
         '<td>'+when(u.createdAt)+'</td>'+
-        '<td>'+when(u.updatedAt)+'</td>'+
+        '<td>'+h(ago(u.updatedAt))+'</td>'+
         '<td class="right mono">'+u.devices+'</td>'+
         '<td class="right mono">'+u.stats.prayerLogs+' <span class="dim">/ '+u.stats.prayerDays+'d</span></td>'+
         '<td class="right mono">'+u.stats.journal+'</td>'+
-        '<td class="right mono">'+bytes(u.stats.bytes)+'</td>'+
-        '<td><span class="pill ok">scrypt</span></td>'+
-        '<td class="right row" style="justify-content:flex-end">'+
-          // The key goes ONLY into a double-quoted data-key attribute (h() escapes ", so it can't
-          // break out) and onclick is a CONSTANT that reads this.dataset.key — the account-controlled
-          // value never enters a JS-string context. (h() alone was not enough: it doesn't escape ',
-          // and HTML-attribute decoding would undo entity-escaping before an inline handler runs.)
-          '<button class="btn" data-key="'+h(u.key)+'" onclick="raw(this.dataset.key)">Data</button> '+
-          '<button class="btn" data-key="'+h(u.key)+'" onclick="signout(this.dataset.key)">Sign out</button> '+
+        '<td><span class="pill ok">🔒 scrypt</span></td>'+
+        '<td onclick="event.stopPropagation()"><div class="acts">'+
+          '<button class="btn" data-key="'+h(u.key)+'" onclick="raw(this.dataset.key)">Raw</button>'+
+          '<button class="btn" data-key="'+h(u.key)+'" onclick="signout(this.dataset.key)">Sign out</button>'+
           '<button class="btn danger" data-key="'+h(u.key)+'" onclick="del(this.dataset.key)">Delete</button>'+
-        '</td></tr>';
+        '</div></td></tr>'+
+        '<tr class="detail'+(open?' open':'')+'" id="det-'+h(u.key)+'"><td colspan="10"><div class="dwrap"><div class="dinner" id="din-'+h(u.key)+'">'+
+          (open&&DET[u.key]?detailHTML(DET[u.key]):'<div class="panel dim">Loading…</div>')+'</div></div></td></tr>';
     }).join('') : '<tr><td colspan="10" class="dim">No accounts yet. Users appear here when they sign up in the app.</td></tr>');
+  // re-hydrate any open detail (animate rings/bars)
+  Object.keys(OPEN).forEach(function(k){ if(OPEN[k]&&DET[k]) requestAnimationFrame(function(){animateDetail(k);}); });
 
   document.getElementById('subs').innerHTML=
     '<tr><th>Push service</th><th>Endpoint</th><th class="right">Scheduled</th><th class="right">Pending</th><th>Updated</th></tr>'+
@@ -418,8 +542,88 @@ async function load(){
   document.getElementById('server').innerHTML=
     'Push '+(s.push?'<span class="pill ok">on</span>':'<span class="pill off">off</span>')+
     ' &nbsp; Email reset '+(s.email?'<span class="pill ok">on</span>':'<span class="pill off">off</span>')+
-    '<br><br>Accounts file: <code>'+h(s.usersFile)+'</code><br>Push file: <code>'+h(s.subsFile)+'</code>'+
     '<br><br>Node '+h(s.node)+' · up '+Math.floor(s.uptimeSec/3600)+'h '+(Math.floor(s.uptimeSec/60)%60)+'m · '+h(s.now);
+}
+
+async function expand(key){
+  OPEN[key]=!OPEN[key];
+  var det=document.getElementById('det-'+key);
+  if(!det) return;
+  var urow=det.previousElementSibling;
+  if(OPEN[key]){
+    urow&&urow.classList.add('open'); det.classList.add('open');
+    if(!DET[key]){
+      try{ var r=await fetch('/admin/api/user/'+encodeURIComponent(key)+'/detail'); DET[key]=await r.json(); }catch(e){ DET[key]={err:1}; }
+      var din=document.getElementById('din-'+key);
+      if(din) din.innerHTML=DET[key].err?'<div class="panel dim">Could not load detail.</div>':detailHTML(DET[key]);
+    }
+    requestAnimationFrame(function(){animateDetail(key);});
+  } else {
+    urow&&urow.classList.remove('open'); det.classList.remove('open');
+  }
+}
+
+function detailHTML(d){
+  var p=d.prayer||{}, l=d.learning||{}, pw=d.password||{};
+  // password panel
+  var pwHTML='<div class="panel"><div class="ptitle">🔒 Password &amp; recovery</div>'+
+    '<div class="kv"><span>Status</span><b>'+(pw.set?'<span class="pill ok">Protected</span>':'<span class="pill off">not set</span>')+'</b></div>'+
+    '<div class="kv"><span>Algorithm</span><b>scrypt · salted</b></div>'+
+    '<div class="kv"><span>Recovery question</span><b>'+(pw.recoveryQ?'<span class="pill ok">yes</span>':'<span class="dim">no</span>')+'</b></div>'+
+    '<div class="kv"><span>Email reset pending</span><b>'+(pw.resetPending?'<span class="pill warnp">active code</span>':'<span class="dim">no</span>')+'</b></div>'+
+    '<div class="kv"><span>Failed logins</span><b class="mono">'+(pw.fails||0)+'</b></div>'+
+    '<p class="dim" style="font-size:11.5px;margin:10px 0 0">The real password can never be shown — only this one-way hash exists.</p></div>';
+  // prayer panel
+  var bars=PRAYERS.map(function(k){ var v=(p.byName&&p.byName[k])||0; var pct=p.days?Math.round(v/p.days*100):0;
+    return '<div class="bar"><span>'+PMETA[k][1]+' '+PMETA[k][0]+'</span><span class="tk"><i data-w="'+pct+'"></i></span><span class="vv">'+v+'</span></div>';}).join('');
+  var heat=(p.recent||[]).map(function(x){ return '<i class="c'+(x.count||0)+'" title="'+h(x.day)+': '+x.count+'/5"></i>'; }).join('');
+  var prayerHTML='<div class="panel"><div class="ptitle">🕌 Prayers — prayed &amp; missed</div>'+
+    '<div class="ringwrap"><div class="ring" data-p="'+(p.completion||0)+'"><b>'+(p.completion||0)+'%</b><i>kept</i></div>'+
+    '<div class="bars">'+bars+'</div></div>'+
+    '<div class="kv" style="margin-top:12px"><span>Prayers kept</span><b class="mono">'+(p.logged||0)+' / '+(p.total||0)+'</b></div>'+
+    '<div class="kv"><span>Days tracked</span><b class="mono">'+(p.days||0)+'</b></div>'+
+    '<div class="kv"><span>Best streak</span><b class="mono">'+(p.streakBest||0)+' days 🔥</b></div>'+
+    (heat?'<div class="heat" title="last 21 days">'+heat+'</div>':'')+'</div>';
+  // learning panel
+  var lvlPct=Math.min(100,(l.xp||0)%100);
+  var chip=function(em,val,lab){ return '<div class="chip"><b data-c="'+(Number(val)||0)+'">0</b><span><span class="em">'+em+'</span>'+lab+'</span></div>'; };
+  var learnHTML='<div class="panel"><div class="ptitle">🌱 Learning &amp; growth</div>'+
+    '<div class="kv"><span>Level</span><b class="mono">Lv '+(l.level||1)+'</b></div>'+
+    '<div class="xpbar"><i data-w="'+lvlPct+'"></i></div>'+
+    '<div class="dim" style="font-size:11px;margin:5px 0 12px">'+(l.xp||0)+' XP total</div>'+
+    '<div class="chips">'+chip('📿',l.dhikr,'Dhikr')+chip('🔖',l.bookmarks,'Bookmarks')+chip('🤲',l.duas,'Duʿaʾ unlocked')+chip('📖',l.adhkar,'Adhkar')+chip('🏅',l.achievements,'Badges')+chip('🔥',p.streakBest,'Best streak')+'</div></div>';
+  // journal panel
+  var jHTML='<div class="panel'+(VEIL?' veiled':'')+'" id="jp-'+h(d.key)+'"><div class="ptitle">📓 Journal <span class="dim" style="text-transform:none;letter-spacing:0">('+(d.journal?d.journal.length:0)+')</span></div>'+
+    ((d.journal&&d.journal.length)? d.journal.slice(0,12).map(function(e){
+      return '<div class="jitem"><div class="jhead"><span>'+when(e.date)+'</span><span class="mood">'+(e.mood?h(e.mood):'')+'</span></div>'+
+        '<div class="jtext">'+(e.text?h(e.text):'<span class="dim">—</span>')+'</div></div>';
+    }).join('')+(d.journal.length>12?'<div class="dim" style="font-size:12px">+'+(d.journal.length-12)+' more…</div>':'')
+      : '<div class="empty">No journal entries yet.</div>')+'</div>';
+  // meta line
+  var meta='<div class="panel"><div class="ptitle">🪪 Profile</div>'+
+    '<div class="kv"><span>Display name</span><b>'+(d.name?h(d.name):'<span class="dim">—</span>')+'</b></div>'+
+    '<div class="kv"><span>Email</span><b>'+(d.email?h(d.email):'<span class="dim">none</span>')+'</b></div>'+
+    '<div class="kv"><span>City</span><b>'+(d.city?h(d.city):'<span class="dim">—</span>')+'</b></div>'+
+    '<div class="kv"><span>Calc method</span><b>'+(d.method!=null?h(d.method):'<span class="dim">—</span>')+'</b></div>'+
+    '<div class="kv"><span>Theme</span><b>'+(d.theme?h(d.theme):'<span class="dim">—</span>')+'</b></div>'+
+    '<div class="kv"><span>Devices</span><b class="mono">'+(d.devices||0)+'</b></div>'+
+    '<div class="kv"><span>Joined</span><b>'+when(d.createdAt)+'</b></div>'+
+    '<div class="kv"><span>Last sync</span><b>'+when(d.updatedAt)+'</b></div>'+
+    '<div class="kv"><span>Data size</span><b class="mono">'+bytes(d.bytes)+'</b></div></div>';
+  return meta+pwHTML+prayerHTML+learnHTML+jHTML;
+}
+
+function animateDetail(key){
+  var din=document.getElementById('din-'+key); if(!din) return;
+  din.querySelectorAll('.ring[data-p]').forEach(function(r){ r.style.setProperty('--p', r.getAttribute('data-p')); });
+  din.querySelectorAll('.tk i[data-w],.xpbar i[data-w]').forEach(function(i){ i.style.width=i.getAttribute('data-w')+'%'; });
+  din.querySelectorAll('.chip b[data-c]').forEach(function(b){ countUp(b,b.getAttribute('data-c')); });
+}
+
+function toggleVeil(){
+  VEIL=!VEIL;
+  document.getElementById('veilT').classList.toggle('on',!VEIL);
+  document.querySelectorAll('.panel[id^="jp-"]').forEach(function(p){ p.classList.toggle('veiled',VEIL); });
 }
 
 async function raw(key){
@@ -436,22 +640,18 @@ async function raw(key){
     '<pre>'+h(JSON.stringify(j.data,null,2))+'</pre>');
   w.document.close();
 }
-
 async function signout(key){
   if(!confirm('Sign '+key+' out of all their devices?')) return;
-  await fetch('/admin/api/user/'+encodeURIComponent(key)+'/signout',{method:'POST'});
-  load();
+  await fetch('/admin/api/user/'+encodeURIComponent(key)+'/signout',{method:'POST'}); DET[key]=null; load();
 }
-
 async function del(key){
   var typed=prompt('This permanently deletes '+key+' and all their synced data.\\n\\nType the username to confirm:');
   if(typed===null) return;
   var r=await fetch('/admin/api/user/'+encodeURIComponent(key)+'/delete',
     {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirm:typed})});
   if(!r.ok){ var j=await r.json().catch(function(){return{}}); alert(j.error||'Could not delete.'); return; }
-  load();
+  delete OPEN[key]; delete DET[key]; load();
 }
-
 async function logout(){ await fetch('/admin/logout',{method:'POST'}); location.href='/admin'; }
 load();
 </script>`);
