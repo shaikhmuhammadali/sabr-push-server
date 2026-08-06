@@ -323,6 +323,15 @@ const sha256hex = (s) => crypto.createHash('sha256').update(s).digest('hex');
 const TOKEN_TTL = 180 * 24 * 3600 * 1000;                // devices stay logged in ~6 months
 const BLOB_MAX = 500000;                                  // per-user data cap, in BYTES (~500 KB)
 const PW_MAX = 256;                                       // cap password length (scrypt cost is caller-controlled otherwise)
+// Password-reset throttles kept on a PERSISTENT per-account guard (u.resetGuard) so deleting the
+// resetCode can never reset them — closes the 429 → delete-code → new-code brute-force loop.
+const RESET_COOLDOWN_MS = 60 * 1000;                      // min gap between codes for one account
+const RESET_CODES_PER_DAY = 6;                            // max codes emailed to one account per 24h
+const RESET_MAX_FAILS = 10;                               // wrong-code attempts before reset locks
+const RESET_FAIL_WINDOW_MS = 60 * 60 * 1000;              // wrong-code lockout window
+// Signup abuse guards: a global account ceiling (a per-IP creation limiter is added below).
+const MAX_ACCOUNTS = parseInt(process.env.MAX_ACCOUNTS, 10) || 5000;   // global backstop; raise via env as usage grows
+let _signupCeilAlerted = false;
 const normUser = (u) => String(u || '').trim().replace(/\s+/g, ' ').slice(0, 40);
 const normEmail = (e) => String(e || '').trim().toLowerCase().slice(0, 254);
 const has = (obj, k) => Object.prototype.hasOwnProperty.call(obj, k);
@@ -383,12 +392,16 @@ function userFromReq(req) {
   return user ? { key: rec.u, user, th } : null;
 }
 const authLimiter = rateLimit({ windowMs: 60 * 1000, max: 20, standardHeaders: true, legacyHeaders: false });
+// Stricter, separate per-IP cap on NEW account creation — signup is a one-time act, so a flood of
+// unauthenticated 500 KB-blob signups (which the general 20/min auth limiter alone permits) can't
+// pile persistence-amplified junk accounts onto the free instance.
+const signupLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false, message: { error: 'too many sign-ups from here — please try again later' } });
 
 // If APP_KEY is set the whole server is private to the owner's app, so gate /auth too (the app
 // sends the same X-App-Key it uses for push). With no APP_KEY, accounts are open (public app).
 function authGuard(req, res, next) { if (!guard(req, res)) return; next(); }
 
-app.post('/auth/signup', authLimiter, authGuard, async (req, res) => {
+app.post('/auth/signup', signupLimiter, authLimiter, authGuard, async (req, res) => {
   try {
     const { username, email, password, data, secQ, secA } = req.body || {};
     const name = normUser(username);
@@ -397,6 +410,12 @@ app.post('/auth/signup', authLimiter, authGuard, async (req, res) => {
     if (typeof password !== 'string' || password.length < 6) return res.status(400).json({ error: 'password too short (6+ characters)' });
     if (password.length > PW_MAX) return res.status(400).json({ error: 'password too long' });
     if (has(accounts.users, key)) return res.status(409).json({ error: 'username taken' });
+    // Global ceiling: a new account past the cap is refused (fail closed) and the owner is alerted once,
+    // so mass-signup abuse can never fill the (free) database unbounded.
+    if (Object.keys(accounts.users).length >= MAX_ACCOUNTS) {
+      if (!_signupCeilAlerted) { _signupCeilAlerted = true; try { alertTelegram('signup ceiling reached (' + MAX_ACCOUNTS + ' accounts) — new signups refused'); } catch (_) {} }
+      return res.status(503).json({ error: 'sign-ups are temporarily closed' });
+    }
     // Email must be unique too. Password recovery resolves an account BY EMAIL, so two
     // accounts sharing one address make that lookup ambiguous: reset codes for one person
     // land in the other's inbox, and whoever loses the tie can never recover their account.
@@ -446,6 +465,7 @@ async function finishReset(res, key, u, newPassword) {
   u.hash = await scryptHex(newPassword, u.salt);
   u.updatedAt = Date.now();
   delete u.resetCode;
+  delete u.resetGuard;      // a successful reset clears all throttle / lockout state
   saveUser(key);            // CRITICAL: persist the NEW hash. issueToken() only saves the tokens
                             // row, so on the Postgres backend the user row would keep the OLD hash
                             // and the reset would silently revert after any restart — locking the
@@ -470,10 +490,18 @@ app.post('/auth/forgot-email', authLimiter, authGuard, async (req, res) => {
     // Always answer the same way whether or not the email matches an account (no enumeration via this route).
     if (u && u.email) {
       const now = Date.now();
-      // Per-account cooldown: at most one email per 60s, so a known address can't be inbox-bombed.
-      if (!(u.resetCode && u.resetCode.sentAt && (now - u.resetCode.sentAt) < 60000)) {
+      const g = u.resetGuard || (u.resetGuard = {});
+      if (!g.dayStart || (now - g.dayStart) > 86400000) { g.dayStart = now; g.dayCount = 0; }         // roll the 24h code-count window
+      if (g.failStart && (now - g.failStart) > RESET_FAIL_WINDOW_MS) { g.fails = 0; g.failStart = 0; } // expire the wrong-code lockout
+      // PERSISTENT guards that survive resetCode deletion, so the 429 → delete-code → new-code loop can
+      // no longer reset the throttle: a 60s cooldown, a per-day code cap, and a wrong-code lockout.
+      const _blocked = ((g.fails || 0) >= RESET_MAX_FAILS)
+        || (g.lastSentAt && (now - g.lastSentAt) < RESET_COOLDOWN_MS)
+        || ((g.dayCount || 0) >= RESET_CODES_PER_DAY);
+      if (!_blocked) {
         const code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
         u.resetCode = { hash: sha256hex(code), exp: now + 15 * 60000, tries: 0, sentAt: now };
+        g.lastSentAt = now; g.dayCount = (g.dayCount || 0) + 1;
         saveUser(uKey);
         try {
           await sendMailRaw({
@@ -508,7 +536,14 @@ app.post('/auth/reset-email', authLimiter, authGuard, async (req, res) => {
     if ((u.resetCode.tries || 0) >= 6) { delete u.resetCode; saveUser(key); return res.status(429).json({ error: 'too many wrong codes — request a new one' }); }
     let ok = false;
     if (typeof code === 'string') { const ch = sha256hex(code.trim()); ok = ch.length === u.resetCode.hash.length && crypto.timingSafeEqual(Buffer.from(ch), Buffer.from(u.resetCode.hash)); }
-    if (!ok) { u.resetCode.tries = (u.resetCode.tries || 0) + 1; saveUser(key); return res.status(401).json({ error: 'that code is not correct' }); }
+    if (!ok) {
+      u.resetCode.tries = (u.resetCode.tries || 0) + 1;
+      const g = u.resetGuard || (u.resetGuard = {});                                                    // PERSISTENT wrong-code counter (survives resetCode deletion)
+      if (!g.failStart || (Date.now() - g.failStart) > RESET_FAIL_WINDOW_MS) { g.failStart = Date.now(); g.fails = 0; }
+      g.fails = (g.fails || 0) + 1;
+      saveUser(key);
+      return res.status(401).json({ error: 'that code is not correct' });
+    }
     await finishReset(res, key, u, newPassword);
   } catch (e) { console.error('[auth/reset-email]', e.message); res.status(500).json({ error: 'internal error' }); }
 });
