@@ -262,7 +262,8 @@ function cacheSet(k, v) {
   while (_ttsCache.size > TTS_CACHE_MAX) _ttsCache.delete(_ttsCache.keys().next().value);
 }
 
-app.get('/tts', async (req, res) => {
+const ttsLimiter = rateLimit({ windowMs: 60 * 1000, max: 30, standardHeaders: true, legacyHeaders: false });   // unauthenticated proxy → cap it tight
+app.get('/tts', ttsLimiter, async (req, res) => {
   const q = String(req.query.q || '').trim().slice(0, 300);
   const tl = String(req.query.tl || 'ar').slice(0, 5);
   if (!q) return res.status(400).json({ error: 'missing q' });
@@ -277,7 +278,10 @@ app.get('/tts', async (req, res) => {
       });
       const buffers = [];
       for (const p of parts) {
-        const r = await fetch(p.url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+        const ctrl = new AbortController(); const timer = setTimeout(() => ctrl.abort(), 15000);   // don't let a stalled upstream hang the socket
+        let r;
+        try { r = await fetch(p.url, { headers: { 'User-Agent': 'Mozilla/5.0' }, signal: ctrl.signal }); }
+        finally { clearTimeout(timer); }
         if (!r.ok) return res.status(502).json({ error: 'tts upstream ' + r.status });
         buffers.push(Buffer.from(await r.arrayBuffer()));
       }
@@ -332,6 +336,8 @@ const RESET_FAIL_WINDOW_MS = 60 * 60 * 1000;              // wrong-code lockout 
 // Signup abuse guards: a global account ceiling (a per-IP creation limiter is added below).
 const MAX_ACCOUNTS = parseInt(process.env.MAX_ACCOUNTS, 10) || 5000;   // global backstop; raise via env as usage grows
 let _signupCeilAlerted = false;
+const MAX_TOKENS_PER_USER = parseInt(process.env.MAX_TOKENS_PER_USER, 10) || 20;     // cap active sessions per account (bounds the token table)
+const MAX_ANALYTICS_USERS = parseInt(process.env.MAX_ANALYTICS_USERS, 10) || 50000;  // cap opt-in analytics device cardinality (bounds the analytics blob)
 const normUser = (u) => String(u || '').trim().replace(/\s+/g, ' ').slice(0, 40);
 const normEmail = (e) => String(e || '').trim().toLowerCase().slice(0, 254);
 const has = (obj, k) => Object.prototype.hasOwnProperty.call(obj, k);
@@ -368,6 +374,11 @@ function issueToken(key) {
   const token = crypto.randomBytes(32).toString('hex');
   const now = Date.now();
   for (const th of Object.keys(accounts.tokens)) if (accounts.tokens[th].exp < now) delete accounts.tokens[th];
+  // Cap sessions per user: evict the oldest (soonest-expiring, since the TTL is fixed) so one account
+  // can't grow the token table without bound (e.g. a script logging in in a loop).
+  const mine = Object.keys(accounts.tokens).filter((th) => accounts.tokens[th].u === key);
+  const over = mine.length - MAX_TOKENS_PER_USER + 1;
+  if (over > 0) { mine.sort((a, b) => accounts.tokens[a].exp - accounts.tokens[b].exp); for (let i = 0; i < over; i++) delete accounts.tokens[mine[i]]; }
   accounts.tokens[sha256hex(token)] = { u: key, exp: now + TOKEN_TTL };
   saveTokens();                     // login must not rewrite every account
   return token;
@@ -697,7 +708,8 @@ async function tick() {
     for (const ep of touched) store.saveSub(ep);
   } finally { _ticking = false; }
 }
-app.all('/tick', async (req, res) => { await tick().catch((e) => console.error('[tick]', e.message)); res.json({ ok: true, at: Date.now() }); });
+const tickLimiter = rateLimit({ windowMs: 60 * 1000, max: 6, standardHeaders: true, legacyHeaders: false });   // the internal 60s interval covers normal operation; keep the public trigger tight
+app.all('/tick', tickLimiter, async (req, res) => { if (!guard(req, res)) return; await tick().catch((e) => console.error('[tick]', e.message)); res.json({ ok: true, at: Date.now() }); });
 if (PUSH_ENABLED) setInterval(() => tick().catch((e) => console.error('[tick]', e.message)), 60000);
 
 /* ── anonymous, opt-in usage analytics ─────────────────────────────────────────
@@ -724,7 +736,10 @@ function trackPruneUsers() {
 }
 function markActive(id, now) {
   const u = analytics.users[id]; if (u) u.a = now;
-  const d = trackDay(now); (analytics.days[d] || (analytics.days[d] = Object.create(null)))[id] = 1;
+  const d = trackDay(now); const set = analytics.days[d] || (analytics.days[d] = Object.create(null));
+  // Bound each day-set: a known device or one already counted today always records; an unknown id only
+  // counts while the set is under the cap, so unauthenticated track pings can't grow it without bound.
+  if (u || set[id] || Object.keys(set).length < MAX_ANALYTICS_USERS) set[id] = 1;
 }
 const trackLimiter = rateLimit({ windowMs: 60 * 1000, max: 120, standardHeaders: true, legacyHeaders: false });
 
@@ -732,8 +747,10 @@ app.post('/api/track/signup', trackLimiter, (req, res) => {
   if (!guard(req, res)) return;
   const b = req.body || {}; if (!okId(b.id)) return res.status(400).json({ error: 'bad id' });
   const now = Date.now();
-  if (!analytics.users[b.id]) analytics.users[b.id] = { c: now, a: now, d: okDevice(b.device), ct: okCountry(b.country) };
-  else analytics.users[b.id].a = now;
+  if (!analytics.users[b.id]) {
+    if (Object.keys(analytics.users).length >= MAX_ANALYTICS_USERS) return res.json({ ok: true });   // cap distinct devices — drop new ones past the ceiling
+    analytics.users[b.id] = { c: now, a: now, d: okDevice(b.device), ct: okCountry(b.country) };
+  } else analytics.users[b.id].a = now;
   markActive(b.id, now); trackPruneDays(); store.saveAnalytics();
   res.json({ ok: true });
 });
