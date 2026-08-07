@@ -19,8 +19,11 @@
     "express-rate-limit": "^7.4.0",
     "google-tts-api": "^2.0.2",
     "helmet": "^7.1.0",
-    "nodemailer": "^6.9.14",
+    "nodemailer": "^9.0.4",
     "pg": "^8.22.0",
     "web-push": "^3.6.7"
+  },
+  "overrides": {
+    "axios": "^1.19.0"
   }
 }
