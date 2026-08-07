@@ -75,6 +75,11 @@ function computeAnalytics(accounts, analytics) {
     dau.push({ t: Math.floor(ms / 1000), count: Object.keys((A.days || {})[utcDay(ms)] || {}).length });
   }
 
+  const errList = Object.values(A.errors || {})
+    .map(e => ({ msg: e.msg, src: e.src, line: e.line, n: e.n, last: Math.floor((e.last || 0) / 1000), stack: e.stack }))
+    .sort((a, b) => b.n - a.n).slice(0, 25);
+  const errTotal = Object.values(A.errors || {}).reduce((sum, e) => sum + (e.n || 0), 0);
+
   return {
     generated_at: Math.floor(now / 1000),
     tracking,
@@ -87,6 +92,7 @@ function computeAnalytics(accounts, analytics) {
     },
     signups, growth, dau,
     top_surahs: surahEntries, devices, countries,
+    errors: errList, errors_total: errTotal,
   };
 }
 
@@ -156,6 +162,7 @@ const PAGE = `<!doctype html><html lang="en"><head>
       <div class="panel"><h2>Top countries</h2><div class="cap">Where users are</div><div id="countries"></div></div>
     </div>
   </div>
+  <div class="panel"><h2>Errors &amp; crashes</h2><div class="cap" id="errCap">Anonymous crash reports, aggregated</div><div id="errors"></div></div>
   <div class="foot" id="foot"></div>
 </div>
 <script>
@@ -192,6 +199,7 @@ function render(s){
   bars(el("topSurahs"), s.top_surahs, function(x){return SURAHS[x.surah-1]||("Surah "+x.surah);}, "#c8a14a");
   bars(el("devices"), s.devices, function(x){return cap(x.device);}, "#4ea99a");
   bars(el("countries"), s.countries, function(x){return x.country;}, "#5b8def");
+  renderErrors(s.errors, s.errors_total);
   el("foot").innerHTML = s.tracking
     ? "Signups and totals are from your accounts; reading, device and country come from users who opted into anonymous usage sharing."
     : "Signups and active counts are <b>real</b>, from your accounts. The reading / device / country / daily-active panels are empty until users opt into anonymous usage sharing in the app.";
@@ -206,6 +214,20 @@ function bars(host, data, label, color){
     return '<div class="bar-row"><div class="name">'+esc(label(x))+'</div>'+
       '<div class="track"><div class="fill" style="width:'+pct+'%;background:'+(color||COLORS[i%5])+'"></div></div>'+
       '<div class="num">'+fmt(x.count)+'</div></div>';
+  }).join("");
+}
+function renderErrors(list, total){
+  var box=el("errors"); if(!box) return;
+  var cp=el("errCap"); if(cp) cp.textContent=(total||0)+" report(s) · "+((list&&list.length)||0)+" distinct · anonymous, no personal data";
+  if(!list || !list.length){ box.innerHTML='<div class="empty">No errors reported — either nothing is crashing, or no device has hit one yet. ✓</div>'; return; }
+  box.innerHTML=list.map(function(e){
+    var loc=esc(e.src||'')+(e.line?(':'+e.line):'');
+    return '<div style="padding:9px 0;border-bottom:1px solid var(--line)">'+
+      '<div style="display:flex;gap:10px;align-items:baseline"><b style="color:#cf7f6b;flex:1;word-break:break-word">'+esc(e.msg)+'</b>'+
+      '<span style="color:var(--muted);white-space:nowrap">×'+fmt(e.n)+'</span></div>'+
+      '<div style="font-size:11.5px;color:var(--muted);margin-top:2px">'+loc+' · last '+new Date((e.last||0)*1000).toLocaleString()+'</div>'+
+      (e.stack?('<pre style="font-size:11px;color:#7d8ba5;margin:5px 0 0;white-space:pre-wrap;max-height:80px;overflow:auto">'+esc(e.stack)+'</pre>'):'')+
+    '</div>';
   }).join("");
 }
 function areaChart(host, data, color, capTpl){

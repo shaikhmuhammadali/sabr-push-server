@@ -187,7 +187,7 @@ let subs = {};
 // Anonymous, opt-in usage analytics (only ever written when a user turns tracking on in the app).
 // Shape: users{ id:{c,a,d,ct} } · surahs{ num:count } · days{ yyyymmdd:{ id:1 } }. All aggregates,
 // no per-event log, no personal data, no account linkage. Bounded + pruned (see trackPrune).
-let analytics = { users: Object.create(null), surahs: Object.create(null), days: Object.create(null) };
+let analytics = { users: Object.create(null), surahs: Object.create(null), days: Object.create(null), errors: Object.create(null) };
 
 // ── app + hardening ───────────────────────────────────────────────────────────
 const app = express();
@@ -778,6 +778,26 @@ app.post('/api/track/forget', trackLimiter, (req, res) => {
   store.saveAnalytics();
   res.json({ ok: true });
 });
+// Client crash / error reports → aggregated by message+source+line (never per-event), so the owner can
+// see in /admin/analytics whether anything is breaking in the field. Bounded + control-chars stripped.
+app.post('/api/track/error', trackLimiter, (req, res) => {
+  if (!guard(req, res)) return;
+  const b = req.body || {}; if (!okId(b.id)) return res.status(400).json({ error: 'bad id' });
+  const now = Date.now();
+  const clean = (s, n) => { s = String(s == null ? '' : s); let o = ''; for (let i = 0; i < s.length && o.length < n; i++){ const c = s.charCodeAt(i); o += (c < 32 || c === 127) ? ' ' : s[i]; } return o; };
+  const msg = clean(b.msg, 200); if (!msg) return res.json({ ok: true });
+  const src = clean(b.src, 150).replace(/[?#].*$/, '');
+  const line = parseInt(b.line, 10) || 0;
+  const key = (msg + '|' + src + '|' + line).slice(0, 320);
+  if (!has(analytics.errors, key)) {
+    if (Object.keys(analytics.errors).length >= 300) return res.json({ ok: true });   // cap distinct errors (bounds the blob)
+    analytics.errors[key] = { msg, src, line, col: parseInt(b.col, 10) || 0, dev: okDevice(b.device), stack: clean(b.stack, 600), n: 0, first: now, last: now };
+  }
+  const e = analytics.errors[key]; e.n++; e.last = now;
+  markActive(b.id, now);
+  store.saveAnalytics();
+  res.json({ ok: true });
+});
 
 /* ── admin portal (/admin) ─────────────────────────────────────────────────────
    A dashboard over everything this server stores: accounts, push subscriptions,
@@ -821,6 +841,7 @@ async function startServer() {
       Object.assign(analytics.users, ana.users || {});
       Object.assign(analytics.surahs, ana.surahs || {});
       Object.assign(analytics.days, ana.days || {});
+      Object.assign(analytics.errors, ana.errors || {});
     }
   } catch (e) {
     // A configured database that will not answer is fatal: booting anyway would
