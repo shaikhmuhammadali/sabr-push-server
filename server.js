@@ -562,6 +562,16 @@ app.post('/auth/reset-email', authLimiter, authGuard, async (req, res) => {
 });
 function maskEmail(e) { const [a, b] = String(e).split('@'); if (!b) return null; return (a.slice(0, 2) + '***@' + b); }
 
+// Live username-availability check (Instagram/Snapchat style) so the create-account form can show
+// "✓ available / ✗ taken" as you type. Usernames are public handles, so exposing taken/available is by
+// design; it is rate-limited and applies the same character rule as sign-up. Read-only, no auth needed.
+const unameCheckLimiter = rateLimit({ windowMs: 60 * 1000, max: 60, standardHeaders: true, legacyHeaders: false });
+app.get('/auth/username-available', unameCheckLimiter, authGuard, (req, res) => {
+  const u = normUser((req.query && req.query.u) || '');
+  if (!/^[A-Za-z0-9_]{3,20}$/.test(u)) return res.json({ available: false, invalid: true });
+  res.json({ available: !has(accounts.users, u.toLowerCase()), username: u });
+});
+
 app.post('/auth/login', authLimiter, authGuard, async (req, res) => {
   try {
     const { username, password } = req.body || {};
