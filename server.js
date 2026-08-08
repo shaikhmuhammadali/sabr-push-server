@@ -417,7 +417,9 @@ app.post('/auth/signup', signupLimiter, authLimiter, authGuard, async (req, res)
     const { username, email, password, data, secQ, secA } = req.body || {};
     const name = normUser(username);
     const key = name.toLowerCase();
-    if (name.length < 2) return res.status(400).json({ error: 'username too short' });
+    // Usernames may only contain letters, numbers and underscore (3-20). Applies to NEW sign-ups only;
+    // existing accounts keep logging in unchanged (login/lookup is not affected by this check).
+    if (!/^[A-Za-z0-9_]{3,20}$/.test(name)) return res.status(400).json({ error: 'username may only contain letters, numbers and underscore (3-20 characters)' });
     if (typeof password !== 'string' || password.length < 6) return res.status(400).json({ error: 'password too short (6+ characters)' });
     if (password.length > PW_MAX) return res.status(400).json({ error: 'password too long' });
     if (has(accounts.users, key)) return res.status(409).json({ error: 'username taken' });
