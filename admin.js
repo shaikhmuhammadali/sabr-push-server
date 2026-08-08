@@ -213,17 +213,31 @@ function mountAdmin(app, ctx) {
     }).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
 
     const totalBytes = users.reduce((n, u) => n + u.stats.bytes, 0);
-    const weekAgo = Date.now() - 7 * 86400000;
+    const now = Date.now(), DAY = 86400000, weekAgo = now - 7 * DAY;
+    const dayStart = (ms) => { const d = new Date(ms); d.setHours(0, 0, 0, 0); return d.getTime(); };
+    const created = users.map((u) => u.createdAt || 0).filter(Boolean);
+    const todayStart = dayStart(now);
+    // 30-day signups sparkline/area chart (real, from account createdAt timestamps)
+    const signups = [];
+    for (let i = 29; i >= 0; i--) { const s = todayStart - i * DAY; signups.push({ t: Math.floor(s / 1000), count: created.filter((t) => t >= s && t < s + DAY).length }); }
+    // cumulative growth curve
+    const growth = [];
+    for (let i = 29; i >= 0; i--) { const end = todayStart - i * DAY + DAY; growth.push({ t: Math.floor((todayStart - i * DAY) / 1000), count: created.filter((t) => t < end).length }); }
     return {
-      users, subs: subsForEmailless(),
+      users, subs: subsForEmailless(), signups, growth,
       totals: {
         users: users.length,
+        activeToday: users.filter((u) => (u.updatedAt || 0) >= todayStart).length,
         activeWeek: users.filter((u) => (u.updatedAt || 0) > weekAgo).length,
+        newToday: created.filter((t) => t >= todayStart).length,
+        newWeek: created.filter((t) => t >= weekAgo).length,
         withEmail: users.filter((u) => u.email).length,
         devices: Object.keys(ctx.accounts.tokens || {}).length,
         journal: users.reduce((n, u) => n + u.stats.journal, 0),
         prayerLogs: users.reduce((n, u) => n + u.stats.prayerLogs, 0),
+        prayerDays: users.reduce((n, u) => n + u.stats.prayerDays, 0),
         dhikr: users.reduce((n, u) => n + u.stats.dhikr, 0),
+        bookmarks: users.reduce((n, u) => n + u.stats.bookmarks, 0),
         bytes: totalBytes,
         subs: Object.keys(ctx.subs || {}).length,
       },
@@ -231,6 +245,9 @@ function mountAdmin(app, ctx) {
         push: Boolean(ctx.PUSH_ENABLED),
         email: typeof ctx.MAIL_ENABLED === 'function' ? Boolean(ctx.MAIL_ENABLED()) : false,
         usersFile: ctx.USERS_STORE, subsFile: ctx.STORE,
+        storeKind: ctx.storeKind || 'file',
+        storeDesc: (typeof ctx.storeDescribe === 'function' ? ctx.storeDescribe() : (ctx.storeKind || 'file')),
+        durable: ctx.storeKind === 'postgres',   // false = ephemeral (accounts wiped on restart/sleep)
         uptimeSec: Math.floor(process.uptime()), node: process.version,
         now: new Date().toISOString(),
       },
@@ -319,81 +336,117 @@ function mountAdmin(app, ctx) {
 
 /* ── views ─────────────────────────────────────────────────────────────────── */
 const CSS = `
-:root{--bg:#080b12;--bg2:#111726;--bg3:#0c1120;--line:#212a3d;--line2:#2c374e;--text:#eef1fb;--dim:#8b96b2;--gold:#e6c169;--gold2:#d9b45b;--green:#4ec98b;--red:#e2685f;--blue:#6aa8ff;--violet:#a98bff}
+:root{--bg:#070a11;--bg2:#0e1420;--bg3:#0b1018;--panel:#111a2b;--panel2:#0d1422;--line:#1f2a3d;--line2:#2b3a54;
+  --text:#eaeef9;--dim:#8794b0;--gold:#e6c169;--gold2:#d9b45b;--goldink:#f3dd9e;
+  --green:#4ec98b;--red:#e2685f;--blue:#6aa8ff;--violet:#a98bff;--teal:#5ad3c6}
 @property --p{syntax:'<number>';inherits:false;initial-value:0}
 *{box-sizing:border-box}
 html{scroll-behavior:smooth}
-body{margin:0;background:radial-gradient(1200px 700px at 80% -10%,#16203a 0,transparent 60%),radial-gradient(900px 600px at -10% 10%,#1a1330 0,transparent 55%),var(--bg);color:var(--text);font:15px/1.55 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;-webkit-font-smoothing:antialiased}
-a{color:var(--gold);text-decoration:none} code,pre{font-family:ui-monospace,Consolas,monospace}
-pre{background:#0a0d14;border:1px solid var(--line);border-radius:10px;padding:12px;overflow:auto;font-size:13px}
-.wrap{max-width:1240px;margin:0 auto;padding:26px 18px 80px}
-header{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:22px;flex-wrap:wrap}
-.brand{display:flex;align-items:center;gap:13px}
-.logo{width:44px;height:44px;border-radius:13px;display:grid;place-items:center;font-size:22px;background:linear-gradient(145deg,#1c2740,#0e1424);border:1px solid var(--line2);box-shadow:0 6px 22px rgba(0,0,0,.45),inset 0 1px 0 rgba(255,255,255,.05);animation:floaty 5s ease-in-out infinite}
+body{margin:0;min-height:100vh;color:var(--text);font:15px/1.55 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;-webkit-font-smoothing:antialiased;
+  background:radial-gradient(1100px 620px at 78% -12%,rgba(30,44,80,.55),transparent 62%),radial-gradient(820px 560px at -8% 8%,rgba(40,26,74,.42),transparent 58%),radial-gradient(760px 720px at 118% 116%,rgba(20,60,58,.22),transparent 60%),var(--bg)}
+a{color:var(--gold);text-decoration:none}
+code,pre{font-family:ui-monospace,Consolas,monospace}
+pre{background:#080c14;border:1px solid var(--line);border-radius:10px;padding:12px;overflow:auto;font-size:13px}
+.dim{color:var(--dim)}.right{text-align:right}.mono{font-variant-numeric:tabular-nums}
+/* ── shell ── */
+.shell{display:grid;grid-template-columns:236px 1fr;min-height:100vh}
+.side{position:sticky;top:0;align-self:start;height:100vh;display:flex;flex-direction:column;gap:4px;padding:22px 16px;border-right:1px solid var(--line);background:linear-gradient(180deg,rgba(255,255,255,.02),transparent),rgba(10,14,22,.5);-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px)}
+.side .brand{display:flex;align-items:center;gap:12px;padding:4px 8px 18px}
+.logo{width:44px;height:44px;border-radius:13px;display:grid;place-items:center;font-size:22px;flex:none;background:linear-gradient(145deg,#1c2740,#0e1424);border:1px solid var(--line2);box-shadow:0 6px 22px rgba(0,0,0,.45),inset 0 1px 0 rgba(255,255,255,.06);animation:floaty 5s ease-in-out infinite}
 @keyframes floaty{50%{transform:translateY(-4px)}}
-h1{font-size:1.28rem;margin:0;letter-spacing:.02em;background:linear-gradient(90deg,#fff,#e6c169);-webkit-background-clip:text;background-clip:text;color:transparent}
-h1 small{color:var(--dim);font-weight:400;font-size:.76rem;display:block;margin-top:2px;-webkit-text-fill-color:var(--dim)}
-.card{background:linear-gradient(180deg,rgba(255,255,255,.02),transparent),var(--bg2);border:1px solid var(--line);border-radius:16px;padding:20px;margin-bottom:16px;opacity:0;transform:translateY(14px);animation:rise .6s cubic-bezier(.2,.7,.2,1) forwards;box-shadow:0 10px 30px rgba(0,0,0,.25)}
+.brand .bt{font-size:1rem;font-weight:800;letter-spacing:.02em;line-height:1.1;background:linear-gradient(90deg,#fff,var(--gold));-webkit-background-clip:text;background-clip:text;color:transparent}
+.brand .bs{display:block;font-size:.63rem;color:var(--dim);letter-spacing:.16em;text-transform:uppercase;margin-top:3px}
+.nav{display:flex;flex-direction:column;gap:2px;margin-top:4px}
+.nav a{display:flex;align-items:center;gap:11px;padding:10px 12px;border-radius:11px;color:var(--dim);font-size:.9rem;font-weight:600;border:1px solid transparent;transition:.18s}
+.nav a .ni{width:18px;text-align:center;font-size:1rem;opacity:.92}
+.nav a:hover{color:var(--text);background:rgba(255,255,255,.03)}
+.nav a.on{color:var(--goldink);background:linear-gradient(90deg,rgba(230,193,105,.14),transparent);border-color:var(--line);box-shadow:inset 2px 0 0 var(--gold)}
+.side .sgrow{flex:1}
+.side .foot{border-top:1px solid var(--line);padding-top:12px;display:flex;flex-direction:column;gap:6px}
+.main{min-width:0;padding:26px 30px 80px;max-width:1200px}
+@media(max-width:900px){.shell{grid-template-columns:1fr}.side{position:static;height:auto;flex-direction:row;flex-wrap:wrap;align-items:center;border-right:0;border-bottom:1px solid var(--line);gap:6px}.side .brand{padding:4px 8px}.nav{flex-direction:row;flex-wrap:wrap;margin:0}.side .sgrow{display:none}.side .foot{border-top:0;flex-direction:row;padding-top:0}.main{padding:20px 16px 60px}}
+/* ── topbar ── */
+.topbar{display:flex;align-items:flex-end;justify-content:space-between;gap:14px;flex-wrap:wrap;margin-bottom:22px}
+.topbar h1{font-size:1.55rem;margin:0;letter-spacing:.01em;font-weight:800}
+.topbar .sub{color:var(--dim);font-size:.82rem;margin-top:4px}
+.tbtools{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+/* ── buttons / pills / toggle ── */
+.btn{background:#131c2d;border:1px solid var(--line);color:var(--text);border-radius:10px;padding:8px 13px;font-size:13px;cursor:pointer;transition:.2s;text-decoration:none;display:inline-flex;align-items:center;gap:7px;white-space:nowrap}
+.btn:hover{border-color:var(--gold);transform:translateY(-1px)}
+.btn.gold{background:linear-gradient(145deg,var(--gold),#c99f43);color:#0a0d14;border-color:transparent;font-weight:800}
+.btn.danger{border-color:#5a2a26;color:#ffb3ad}.btn.danger:hover{border-color:var(--red)}
+.pill{display:inline-flex;align-items:center;gap:5px;padding:4px 11px;border-radius:999px;font-size:.72rem;border:1px solid var(--line);color:var(--dim)}
+.pill.ok{color:var(--green);border-color:#245c42;background:rgba(78,201,139,.08)}
+.pill.off{color:var(--red);border-color:#5a2a26}
+.pill.warnp{color:var(--gold);border-color:#5a4a1e;background:rgba(230,193,105,.08)}
+.toggle{display:inline-flex;align-items:center;gap:7px;font-size:.74rem;color:var(--dim);cursor:pointer;user-select:none}
+.sw{width:34px;height:19px;border-radius:99px;background:#1c2740;border:1px solid var(--line);position:relative;transition:.25s}
+.sw::after{content:'';position:absolute;top:1px;left:1px;width:15px;height:15px;border-radius:50%;background:var(--dim);transition:.25s}
+.toggle.on .sw{background:rgba(230,193,105,.25);border-color:var(--gold)}.toggle.on .sw::after{left:16px;background:var(--gold)}
+/* ── section / card ── */
+.section{margin-bottom:24px;scroll-margin-top:18px}
+.card{background:linear-gradient(180deg,rgba(255,255,255,.02),transparent),var(--panel);border:1px solid var(--line);border-radius:18px;padding:20px;box-shadow:0 14px 40px -18px rgba(0,0,0,.6);opacity:0;transform:translateY(14px);animation:rise .6s cubic-bezier(.2,.7,.2,1) forwards}
 .card.warn{border-color:#5a4a1e;background:#1a1710}
 @keyframes rise{to{opacity:1;transform:none}}
-.card:nth-child(1){animation-delay:.02s}.card:nth-child(2){animation-delay:.08s}.card:nth-child(3){animation-delay:.14s}.card:nth-child(4){animation-delay:.2s}.card:nth-child(5){animation-delay:.26s}
-h2{font-size:.76rem;letter-spacing:.2em;text-transform:uppercase;color:var(--gold);margin:0 0 15px;display:flex;align-items:center;gap:8px}
-h2::before{content:'';width:16px;height:2px;border-radius:2px;background:linear-gradient(90deg,var(--gold),transparent)}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
-.stat{position:relative;background:linear-gradient(180deg,#141b2c,#0d1220);border:1px solid var(--line);border-radius:13px;padding:15px 16px;overflow:hidden;transition:transform .25s,border-color .25s,box-shadow .25s}
-.stat:hover{transform:translateY(-3px);border-color:var(--line2);box-shadow:0 12px 26px rgba(0,0,0,.35)}
-.stat::after{content:'';position:absolute;inset:0 0 auto 0;height:2px;background:linear-gradient(90deg,var(--gold),transparent);opacity:.7}
-.stat b{display:block;font-size:1.7rem;font-weight:800;font-variant-numeric:tabular-nums;letter-spacing:-.02em}
-.stat span{color:var(--dim);font-size:.74rem;text-transform:uppercase;letter-spacing:.08em}
-.stat .ic{position:absolute;right:12px;top:12px;font-size:1.1rem;opacity:.5}
-table{width:100%;border-collapse:collapse;font-size:14px} .tblwrap{overflow-x:auto;border-radius:10px}
-th,td{text-align:left;padding:11px 10px;border-bottom:1px solid var(--line);vertical-align:middle}
-th{color:var(--dim);font-size:.7rem;letter-spacing:.11em;text-transform:uppercase;font-weight:600}
-tr.urow{cursor:pointer;transition:background .18s} tr.urow:hover{background:rgba(230,193,105,.05)}
+h2.sh{font-size:.72rem;letter-spacing:.2em;text-transform:uppercase;color:var(--gold);margin:0 0 16px;display:flex;align-items:center;gap:9px}
+h2.sh::before{content:'';width:16px;height:2px;border-radius:2px;background:linear-gradient(90deg,var(--gold),transparent)}
+h2.sh .c{margin-left:auto;color:var(--dim);letter-spacing:.04em;font-size:.9em;text-transform:none}
+/* ── hero KPIs ── */
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(184px,1fr));gap:14px;margin-bottom:22px}
+.kpi{position:relative;overflow:hidden;border-radius:18px;padding:18px 18px 16px;border:1px solid var(--line);background:linear-gradient(165deg,rgba(22,32,52,.55),#0d1524),var(--panel2);transition:transform .28s,border-color .28s,box-shadow .28s;opacity:0;transform:translateY(16px);animation:rise .55s cubic-bezier(.2,.7,.2,1) forwards}
+.kpi:hover{transform:translateY(-4px);border-color:var(--line2);box-shadow:0 20px 40px -22px rgba(0,0,0,.85)}
+.kpi::before{content:'';position:absolute;inset:0 0 auto 0;height:3px;background:linear-gradient(90deg,var(--acc,var(--gold)),transparent 82%)}
+.kpi .ico{width:38px;height:38px;border-radius:11px;display:grid;place-items:center;font-size:1.15rem;margin-bottom:12px;background:radial-gradient(circle at 38% 32%,color-mix(in srgb,var(--acc,var(--gold)) 32%,transparent),transparent 72%);border:1px solid var(--line)}
+.kpi .v{font-size:2rem;font-weight:800;font-variant-numeric:tabular-nums;letter-spacing:-.02em;line-height:1}
+.kpi .l{color:var(--dim);font-size:.72rem;text-transform:uppercase;letter-spacing:.09em;margin-top:5px;font-weight:600}
+.kpi .t{font-size:.72rem;margin-top:9px;color:var(--green);display:flex;align-items:center;gap:5px}
+.kpi .t.flat{color:var(--dim)}
+/* ── chart ── */
+.chart svg{display:block;width:100%}.chart svg text{fill:var(--dim);font-size:10px}
+/* ── tables ── */
+table{width:100%;border-collapse:collapse;font-size:14px}.tblwrap{overflow-x:auto;border-radius:12px}
+th,td{text-align:left;padding:12px 11px;border-bottom:1px solid var(--line);vertical-align:middle}
+th{color:var(--dim);font-size:.68rem;letter-spacing:.11em;text-transform:uppercase;font-weight:600}
+tr.urow{cursor:pointer;transition:background .18s}tr.urow:hover{background:rgba(230,193,105,.05)}
 tr.urow.open{background:rgba(230,193,105,.07)}
 tr:last-child td{border-bottom:0}
-.av{width:34px;height:34px;border-radius:10px;display:inline-grid;place-items:center;font-weight:800;color:#0a0d14;background:linear-gradient(145deg,var(--gold),#b98f3e);font-size:.9rem}
-.uname{display:flex;align-items:center;gap:11px}
-.chev{display:inline-block;transition:transform .3s;color:var(--dim)} tr.urow.open .chev{transform:rotate(90deg);color:var(--gold)}
-.btn{background:#182034;border:1px solid var(--line);color:var(--text);border-radius:9px;padding:7px 12px;font-size:13px;cursor:pointer;transition:.2s}
-.btn:hover{border-color:var(--gold);transform:translateY(-1px)} .btn.danger{border-color:#5a2a26;color:#ffb3ad} .btn.danger:hover{border-color:var(--red)}
-.btn.gold{background:linear-gradient(145deg,var(--gold),#c99f43);color:#0a0d14;border-color:transparent;font-weight:700}
-.pill{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:999px;font-size:.72rem;border:1px solid var(--line);color:var(--dim)}
-.pill.ok{color:var(--green);border-color:#245c42;background:rgba(78,201,139,.08)} .pill.off{color:var(--red);border-color:#5a2a26}
-.pill.warnp{color:var(--gold);border-color:#5a4a1e;background:rgba(230,193,105,.08)}
-.dim{color:var(--dim)} .right{text-align:right} .mono{font-variant-numeric:tabular-nums}
-input[type=password],input[type=text]{background:#0a0d14;border:1px solid var(--line);color:var(--text);border-radius:10px;padding:12px 14px;font-size:15px;width:100%}
-.login{max-width:400px;margin:13vh auto;padding:0 18px}
-.note{background:linear-gradient(90deg,rgba(230,193,105,.08),transparent);border-left:3px solid var(--gold);padding:12px 15px;border-radius:0 10px 10px 0;color:#cdbd94;font-size:13.5px;margin-bottom:16px}
-.err{color:#ffb3ad;font-size:13.5px;min-height:19px;margin-top:9px}
-.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.av{width:36px;height:36px;border-radius:11px;display:inline-grid;place-items:center;font-weight:800;color:#0a0d14;background:linear-gradient(145deg,var(--gold),#b98f3e);font-size:.92rem}
+.uname{display:flex;align-items:center;gap:11px}.uname b{font-weight:700}
+.chev{display:inline-block;transition:transform .3s;color:var(--dim)}tr.urow.open .chev{transform:rotate(90deg);color:var(--gold)}
 .acts{display:flex;gap:6px;justify-content:flex-end}
-/* ── detail panel ── */
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+input[type=password],input[type=text]{background:#080c14;border:1px solid var(--line);color:var(--text);border-radius:10px;padding:12px 14px;font-size:15px;width:100%}
+/* ── login ── */
+.login{max-width:400px;margin:13vh auto;padding:0 18px}
+.login .brand{display:flex;justify-content:center;margin-bottom:8px}
+h1{font-size:1.28rem;margin:0;letter-spacing:.02em}
+h1.center{text-align:center;background:linear-gradient(90deg,#fff,var(--gold));-webkit-background-clip:text;background-clip:text;color:transparent}
+h1 small{color:var(--dim);font-weight:400;font-size:.76rem;display:block;margin-top:2px;-webkit-text-fill-color:var(--dim)}
+h2{font-size:.76rem;letter-spacing:.2em;text-transform:uppercase;color:var(--gold);margin:0 0 15px}
+.note{background:linear-gradient(90deg,rgba(230,193,105,.08),transparent);border-left:3px solid var(--gold);padding:12px 15px;border-radius:0 10px 10px 0;color:#cdbd94;font-size:13.5px;margin-bottom:18px}
+.err{color:#ffb3ad;font-size:13.5px;min-height:19px;margin-top:9px}
+/* ── deep-dive detail ── */
 .detail td{padding:0;border-bottom:1px solid var(--line)}
 .dwrap{overflow:hidden;max-height:0;transition:max-height .5s cubic-bezier(.2,.7,.2,1)}
-tr.detail.open .dwrap{max-height:1400px}
+tr.detail.open .dwrap{max-height:1600px}
 .dinner{padding:20px 6px;display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px}
 .panel{background:linear-gradient(180deg,#0f1524,#0a0e1a);border:1px solid var(--line);border-radius:14px;padding:16px 17px;opacity:0;transform:translateY(10px)}
 tr.detail.open .panel{animation:rise .5s ease forwards}
 tr.detail.open .panel:nth-child(2){animation-delay:.06s}tr.detail.open .panel:nth-child(3){animation-delay:.12s}tr.detail.open .panel:nth-child(4){animation-delay:.18s}
 .ptitle{font-size:.7rem;letter-spacing:.14em;text-transform:uppercase;color:var(--dim);margin:0 0 12px;display:flex;align-items:center;gap:7px}
-/* prayer ring */
 .ringwrap{display:flex;align-items:center;gap:16px}
-.ring{--p:0;width:104px;height:104px;flex:0 0 auto;border-radius:50%;display:grid;place-items:center;
-  background:conic-gradient(var(--gold) calc(var(--p)*1%),#1a2233 0);transition:--p 1.1s cubic-bezier(.2,.7,.2,1)}
+.ring{--p:0;width:104px;height:104px;flex:0 0 auto;border-radius:50%;display:grid;place-items:center;position:relative;background:conic-gradient(var(--gold) calc(var(--p)*1%),#1a2233 0);transition:--p 1.1s cubic-bezier(.2,.7,.2,1)}
 .ring::before{content:'';position:absolute;width:78px;height:78px;border-radius:50%;background:var(--bg3);box-shadow:inset 0 2px 8px rgba(0,0,0,.5)}
 .ring b{position:relative;font-size:1.35rem;font-weight:800;font-variant-numeric:tabular-nums}
 .ring i{position:relative;display:block;font-size:.6rem;letter-spacing:.1em;color:var(--dim);font-style:normal;text-align:center}
 .bars{flex:1;display:flex;flex-direction:column;gap:7px;min-width:120px}
-.bar{display:grid;grid-template-columns:64px 1fr 34px;align-items:center;gap:8px;font-size:.78rem}
+.bar{display:grid;grid-template-columns:74px 1fr 34px;align-items:center;gap:8px;font-size:.78rem}
 .bar .tk{height:8px;border-radius:5px;background:#161d2e;overflow:hidden}
 .bar .tk i{display:block;height:100%;width:0;border-radius:5px;background:linear-gradient(90deg,var(--gold2),var(--gold));transition:width 1s cubic-bezier(.2,.7,.2,1)}
 .bar .vv{text-align:right;color:var(--dim);font-variant-numeric:tabular-nums}
-/* heat strip */
 .heat{display:flex;gap:3px;margin-top:14px;flex-wrap:wrap}
 .heat i{width:13px;height:13px;border-radius:3px;background:#141b2c;border:1px solid #1c2740}
 .heat i.c1{background:#2a3a24}.heat i.c2{background:#3d5c2f}.heat i.c3{background:#4e7a3a}.heat i.c4{background:#5f9a45}.heat i.c5{background:var(--green)}
-/* learning chips */
 .chips{display:grid;grid-template-columns:1fr 1fr;gap:9px}
 .chip{background:#0e1526;border:1px solid var(--line);border-radius:11px;padding:11px 12px}
 .chip b{display:block;font-size:1.25rem;font-weight:800;font-variant-numeric:tabular-nums}
@@ -401,10 +454,8 @@ tr.detail.open .panel:nth-child(2){animation-delay:.06s}tr.detail.open .panel:nt
 .chip .em{font-size:.95rem;margin-right:5px}
 .xpbar{height:7px;border-radius:5px;background:#161d2e;margin-top:9px;overflow:hidden}
 .xpbar i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--violet),var(--blue));transition:width 1.1s ease}
-/* password panel */
 .kv{display:flex;justify-content:space-between;gap:10px;padding:7px 0;border-bottom:1px dashed #1c2436;font-size:.86rem}
-.kv:last-child{border-bottom:0} .kv span{color:var(--dim)}
-/* journal */
+.kv:last-child{border-bottom:0}.kv span{color:var(--dim)}
 .jitem{border:1px solid var(--line);border-radius:11px;padding:11px 13px;margin-bottom:9px;background:#0d1320}
 .jhead{display:flex;justify-content:space-between;align-items:center;gap:8px;font-size:.78rem;color:var(--dim);margin-bottom:7px}
 .jtext{font-size:.9rem;line-height:1.5;transition:filter .35s;color:#dfe4f2}
@@ -412,11 +463,7 @@ tr.detail.open .panel:nth-child(2){animation-delay:.06s}tr.detail.open .panel:nt
 .reveal{font-size:.68rem;color:var(--gold);cursor:pointer;border:1px solid var(--line);border-radius:7px;padding:2px 8px;background:transparent}
 .mood{font-size:1rem}
 .empty{color:var(--dim);font-size:.86rem;padding:8px 0;font-style:italic}
-.toggle{display:inline-flex;align-items:center;gap:7px;font-size:.74rem;color:var(--dim);cursor:pointer;user-select:none}
-.sw{width:34px;height:19px;border-radius:99px;background:#1c2740;border:1px solid var(--line);position:relative;transition:.25s}
-.sw::after{content:'';position:absolute;top:1px;left:1px;width:15px;height:15px;border-radius:50%;background:var(--dim);transition:.25s}
-.toggle.on .sw{background:rgba(230,193,105,.25);border-color:var(--gold)} .toggle.on .sw::after{left:16px;background:var(--gold)}
-@media (max-width:560px){ .wrap{padding:18px 12px 60px} .acts{justify-content:flex-start} .dinner{grid-template-columns:1fr} .ring{width:92px;height:92px} }
+@media(max-width:560px){.dinner{grid-template-columns:1fr}.ring{width:92px;height:92px}.acts{justify-content:flex-start}}
 @media (prefers-reduced-motion:reduce){*{animation-duration:.001s!important;transition-duration:.001s!important}}
 `;
 
@@ -432,7 +479,7 @@ function loginPage() {
   return page('Admin', `
   <div class="login">
     <div class="brand" style="justify-content:center;margin-bottom:8px"><div class="logo">🌙</div></div>
-    <h1 style="text-align:center">Sirat Khushu <small>admin portal</small></h1>
+    <h1 class="center">Sirat Khushu <small>admin portal</small></h1>
     <div class="card" style="margin-top:16px">
       <h2>Sign in</h2>
       <input id="k" type="password" placeholder="Admin key" autofocus autocomplete="current-password">
@@ -459,29 +506,58 @@ function loginPage() {
 
 function dashboardPage() {
   return page('Admin', `
-  <header>
-    <div class="brand"><div class="logo">🌙</div>
-      <h1>Sirat Khushu <small>admin portal — every account on this server</small></h1></div>
-    <div class="row">
-      <label class="toggle" id="veilT" onclick="toggleVeil()"><span class="sw"></span> Privacy veil</label>
-      <a class="btn" href="/admin/analytics">📊 Analytics</a>
-      <button class="btn" onclick="load()">↻ Refresh</button>
-      <a class="btn" href="/admin/api/export">⭳ Export</a>
-      <button class="btn" onclick="logout()">Log out</button>
-    </div>
-  </header>
+  <div class="shell">
+    <aside class="side">
+      <div class="brand"><div class="logo">🌙</div><div><span class="bt">Sirat Khushu</span><span class="bs">Admin portal</span></div></div>
+      <nav class="nav" id="nav">
+        <a href="#s-overview" class="on"><span class="ni">◈</span> Overview</a>
+        <a href="#s-accounts"><span class="ni">👤</span> Accounts</a>
+        <a href="#s-subs"><span class="ni">🔔</span> Subscriptions</a>
+        <a href="#s-server"><span class="ni">🖥️</span> Server</a>
+      </nav>
+      <div class="sgrow"></div>
+      <div class="foot">
+        <a class="btn" href="/admin/analytics"><span>📊</span> Analytics</a>
+        <a class="btn" href="/admin/api/export"><span>⭳</span> Export JSON</a>
+        <button class="btn" onclick="logout()"><span>⏻</span> Log out</button>
+      </div>
+    </aside>
 
-  <div class="note">
-    <b>Passwords are never shown — they are not stored.</b> Sign-up runs
-    <code>scrypt(password, per-user salt)</code> and keeps only that one-way hash, so nobody — you
-    included — can reverse it. Journal reflections are personal; keep the <b>Privacy veil</b> on unless you
-    have a real reason to read them. Click any account row to open its full detail.
+    <main class="main">
+      <div class="topbar">
+        <div><h1>Overview</h1><div class="sub">Every account on this server · live records</div></div>
+        <div class="tbtools">
+          <label class="toggle" id="veilT" onclick="toggleVeil()"><span class="sw"></span> Privacy veil</label>
+          <span class="pill" id="updated">—</span>
+          <button class="btn" onclick="load(true)">↻ Refresh</button>
+        </div>
+      </div>
+
+      <div class="note">
+        <b>Passwords are never shown — they are not stored.</b> Sign-up runs
+        <code>scrypt(password, per-user salt)</code> and keeps only that one-way hash, so nobody — you
+        included — can reverse it. Journal reflections are personal; keep the <b>Privacy veil</b> on unless you
+        have a real reason to read them. Click any account row to open its full detail.
+      </div>
+
+      <section class="section" id="s-overview">
+        <div class="kpis" id="kpis"></div>
+        <div class="card chartcard"><h2 class="sh">New signups <span class="c">last 30 days · real</span></h2><div class="chart" id="signupsChart"></div></div>
+      </section>
+
+      <section class="section" id="s-accounts">
+        <div class="card"><h2 class="sh">Accounts <span class="c" id="accCount"></span></h2><div class="tblwrap"><table id="users"></table></div></div>
+      </section>
+
+      <section class="section" id="s-subs">
+        <div class="card"><h2 class="sh">Push subscriptions</h2><div class="tblwrap"><table id="subs"></table></div></div>
+      </section>
+
+      <section class="section" id="s-server">
+        <div class="card"><h2 class="sh">Server health</h2><div id="server" class="dim" style="font-size:13.5px"></div></div>
+      </section>
+    </main>
   </div>
-
-  <div class="card"><h2>Overview</h2><div class="grid" id="stats"></div></div>
-  <div class="card"><h2>Accounts</h2><div class="tblwrap"><table id="users"></table></div></div>
-  <div class="card"><h2>Push subscriptions</h2><div class="tblwrap"><table id="subs"></table></div></div>
-  <div class="card"><h2>Server</h2><div id="server" class="dim" style="font-size:13.5px"></div></div>
 
 <script>
 var D=null, VEIL=true, DET={}, OPEN={};
@@ -493,18 +569,38 @@ function when(t){ if(!t) return '<span class="dim">—</span>'; var d=new Date(t
 function ago(t){ if(!t) return '—'; var s=(Date.now()-t)/1000; if(s<3600) return Math.max(1,Math.floor(s/60))+'m ago'; if(s<86400) return Math.floor(s/3600)+'h ago'; return Math.floor(s/86400)+'d ago'; }
 function bytes(n){ if(!n) return '0 B'; if(n<1024) return n+' B'; if(n<1048576) return (n/1024).toFixed(1)+' KB'; return (n/1048576).toFixed(2)+' MB'; }
 function init(s){ s=String(s||'?').trim(); return (s[0]||'?').toUpperCase(); }
-function countUp(el,to){ to=Number(to)||0; var dur=750,t0=null; function step(ts){ if(!t0)t0=ts; var p=Math.min(1,(ts-t0)/dur); el.textContent=Math.round(to*(1-Math.pow(1-p,3))).toLocaleString(); if(p<1)requestAnimationFrame(step);} requestAnimationFrame(step); }
+function countUp(el,to){ to=Number(to)||0; var dur=820,t0=null; function step(ts){ if(!t0)t0=ts; var p=Math.min(1,(ts-t0)/dur); el.textContent=Math.round(to*(1-Math.pow(1-p,3))).toLocaleString(); if(p<1)requestAnimationFrame(step);} requestAnimationFrame(step); }
 
-async function load(){
-  var r=await fetch('/admin/api/snapshot'); if(r.status===401){location.reload();return;}
-  D=await r.json(); var t=D.totals;
-  var stats=[['Accounts',t.users,'👤'],['Active / week',t.activeWeek,'✨'],['With email',t.withEmail,'✉️'],
-    ['Devices',t.devices,'📱'],['Journal entries',t.journal,'📓'],['Prayers logged',t.prayerLogs,'🕌'],
-    ['Dhikr total',t.dhikr,'📿'],['Data stored',null,'💾']];
-  document.getElementById('stats').innerHTML=stats.map(function(s){
-    return '<div class="stat"><span class="ic">'+s[2]+'</span><b data-c="'+(s[1]==null?'':s[1])+'">'+(s[1]==null?bytes(t.bytes):'0')+'</b><span>'+h(s[0])+'</span></div>';}).join('');
-  document.querySelectorAll('#stats b[data-c]').forEach(function(b){ if(b.getAttribute('data-c')!=='') countUp(b,b.getAttribute('data-c')); });
+var LAST_SIG='';
+async function load(force){
+  var r; try{ r=await fetch('/admin/api/snapshot'); }catch(e){ return; }
+  if(r.status===401){location.reload();return;}
+  var nd=await r.json();
+  // change-signature: only re-render when something actually changed, so the auto-refresh never
+  // flickers the table or interrupts a deep-dive the admin is reading.
+  var sig=nd.users.length+'|'+nd.totals.prayerLogs+'|'+nd.totals.journal+'|'+nd.subs.length+'|'+nd.totals.newToday+'|'+(nd.users[0]&&nd.users[0].updatedAt);
+  D=nd; if(!force && sig===LAST_SIG){ return; } LAST_SIG=sig; var t=D.totals;
+  var K=[
+    ['Accounts',t.users,'👤','var(--gold)', (t.newWeek?('+'+t.newWeek+' this week'):'no new this week')],
+    ['Active · week',t.activeWeek,'✨','var(--teal)', (t.activeToday||0)+' today'],
+    ['New · today',t.newToday,'🌱','var(--green)', (t.newWeek||0)+' this week'],
+    ['Prayers logged',t.prayerLogs,'🕌','var(--blue)', (t.prayerDays||0)+' prayer-days'],
+    ['Journal entries',t.journal,'📓','var(--violet)', (t.dhikr||0).toLocaleString()+' dhikr'],
+    ['Devices',t.devices,'📱','var(--gold)', (t.withEmail||0)+' with email'],
+    ['Data stored',null,'💾','var(--teal)', (t.subs||0)+' push subs'],
+    ['Bookmarks',t.bookmarks,'🔖','var(--blue)', 'saved by users'],
+  ];
+  document.getElementById('kpis').innerHTML = K.map(function(s){
+    var isBytes = s[1]==null;
+    return '<div class="kpi" style="--acc:'+s[3]+'"><div class="ico">'+s[2]+'</div>'+
+      '<div class="v" data-c="'+(isBytes?'':s[1])+'">'+(isBytes?bytes(t.bytes):'0')+'</div>'+
+      '<div class="l">'+h(s[0])+'</div><div class="t'+(!s[4]?' flat':'')+'">'+h(s[4]||'—')+'</div></div>';
+  }).join('');
+  document.querySelectorAll('#kpis .v[data-c]').forEach(function(b){ if(b.getAttribute('data-c')!=='') countUp(b,b.getAttribute('data-c')); });
 
+  areaChart(document.getElementById('signupsChart'), D.signups||[], '#e6c169');
+
+  document.getElementById('accCount').textContent = (D.users.length||0)+' total';
   document.getElementById('users').innerHTML=
     '<tr><th></th><th>User</th><th>Email</th><th>Joined</th><th>Last active</th><th class="right">Devices</th>'+
     '<th class="right">Prayers</th><th class="right">Journal</th><th>Password</th><th></th></tr>'+
@@ -528,7 +624,6 @@ async function load(){
         '<tr class="detail'+(open?' open':'')+'" id="det-'+h(u.key)+'"><td colspan="10"><div class="dwrap"><div class="dinner" id="din-'+h(u.key)+'">'+
           (open&&DET[u.key]?detailHTML(DET[u.key]):'<div class="panel dim">Loading…</div>')+'</div></div></td></tr>';
     }).join('') : '<tr><td colspan="10" class="dim">No accounts yet. Users appear here when they sign up in the app.</td></tr>');
-  // re-hydrate any open detail (animate rings/bars)
   Object.keys(OPEN).forEach(function(k){ if(OPEN[k]&&DET[k]) requestAnimationFrame(function(){animateDetail(k);}); });
 
   document.getElementById('subs').innerHTML=
@@ -539,11 +634,49 @@ async function load(){
     }).join('') : '<tr><td colspan="5" class="dim">No push subscriptions yet.</td></tr>');
 
   var s=D.server;
+  var storage = s.durable
+    ? '<span class="pill ok">durable · Postgres</span>'
+    : '<span class="pill off">ephemeral · file</span>';
+  var warn = s.durable ? '' :
+    '<div class="note" style="margin:12px 0 0"><b>⚠ Accounts are NOT durable on this instance.</b> Storage is a local file on an ephemeral filesystem — every restart, redeploy or sleep <b>wipes all accounts</b>. Set a free Postgres <code>DATABASE_URL</code> in the Render dashboard so signups survive and always appear here.</div>';
   document.getElementById('server').innerHTML=
     'Push '+(s.push?'<span class="pill ok">on</span>':'<span class="pill off">off</span>')+
     ' &nbsp; Email reset '+(s.email?'<span class="pill ok">on</span>':'<span class="pill off">off</span>')+
-    '<br><br>Node '+h(s.node)+' · up '+Math.floor(s.uptimeSec/3600)+'h '+(Math.floor(s.uptimeSec/60)%60)+'m · '+h(s.now);
+    ' &nbsp; Storage '+storage+
+    '<br><br>'+h(s.storeDesc||'')+'<br>Node '+h(s.node)+' · up '+Math.floor(s.uptimeSec/3600)+'h '+(Math.floor(s.uptimeSec/60)%60)+'m · '+h(s.now)+
+    warn;
+  el_updated(s);
+  spy();
 }
+function el_updated(s){ var u=document.getElementById('updated'); if(u) u.innerHTML='<span style="color:var(--green)">●</span> live · auto-refresh'; }
+
+function areaChart(host, data, color){
+  if(!host) return;
+  if(!data.length){ host.innerHTML='<div class="empty">No signups yet.</div>'; return; }
+  var W=680,H=180,P=26,n=data.length;
+  var max=Math.max.apply(null,data.map(function(d){return d.count;}))||1;
+  var xs=function(i){return P+(W-2*P)*(i/(n-1));},ys=function(v){return H-P-(H-2*P)*(v/max);};
+  var line="",area="M"+xs(0)+","+ys(0);
+  data.forEach(function(d,i){var x=xs(i),y=ys(d.count);line+=(i?"L":"M")+x+","+y+" ";area+="L"+x+","+y+" ";});
+  area+="L"+xs(n-1)+","+ys(0)+"Z";
+  var ticks="";
+  for(var i=0;i<n;i+=Math.ceil(n/6)){var dt=new Date(data[i].t*1000);
+    ticks+='<text x="'+xs(i)+'" y="'+(H-7)+'" text-anchor="middle">'+(dt.getMonth()+1)+'/'+dt.getDate()+'</text>';}
+  var cid='g_'+color.slice(1);
+  host.innerHTML='<svg viewBox="0 0 '+W+' '+H+'" width="100%" preserveAspectRatio="xMidYMid meet">'+
+    '<defs><linearGradient id="'+cid+'" x1="0" y1="0" x2="0" y2="1">'+
+    '<stop offset="0" stop-color="'+color+'" stop-opacity=".34"/><stop offset="1" stop-color="'+color+'" stop-opacity="0"/></linearGradient></defs>'+
+    '<path d="'+area+'" fill="url(#'+cid+')"/><path d="'+line+'" fill="none" stroke="'+color+'" stroke-width="2.5" stroke-linejoin="round"/>'+
+    '<text x="'+P+'" y="16">peak '+max+'/day</text>'+ticks+'</svg>';
+}
+
+var SPY=['s-overview','s-accounts','s-subs','s-server'];
+function spy(){ var y=(window.scrollY||0)+130,cur=SPY[0];
+  SPY.forEach(function(id){ var e=document.getElementById(id); if(e&&e.offsetTop<=y)cur=id; });
+  document.querySelectorAll('#nav a').forEach(function(a){ a.classList.toggle('on', a.getAttribute('href')==='#'+cur); });
+  var ti=document.querySelector('.topbar h1'); if(ti){ var m={'s-overview':'Overview','s-accounts':'Accounts','s-subs':'Subscriptions','s-server':'Server'}; ti.textContent=m[cur]||'Overview'; }
+}
+window.addEventListener('scroll',spy,{passive:true});
 
 async function expand(key){
   OPEN[key]=!OPEN[key];
@@ -565,7 +698,6 @@ async function expand(key){
 
 function detailHTML(d){
   var p=d.prayer||{}, l=d.learning||{}, pw=d.password||{};
-  // password panel
   var pwHTML='<div class="panel"><div class="ptitle">🔒 Password &amp; recovery</div>'+
     '<div class="kv"><span>Status</span><b>'+(pw.set?'<span class="pill ok">Protected</span>':'<span class="pill off">not set</span>')+'</b></div>'+
     '<div class="kv"><span>Algorithm</span><b>scrypt · salted</b></div>'+
@@ -573,7 +705,6 @@ function detailHTML(d){
     '<div class="kv"><span>Email reset pending</span><b>'+(pw.resetPending?'<span class="pill warnp">active code</span>':'<span class="dim">no</span>')+'</b></div>'+
     '<div class="kv"><span>Failed logins</span><b class="mono">'+(pw.fails||0)+'</b></div>'+
     '<p class="dim" style="font-size:11.5px;margin:10px 0 0">The real password can never be shown — only this one-way hash exists.</p></div>';
-  // prayer panel
   var bars=PRAYERS.map(function(k){ var v=(p.byName&&p.byName[k])||0; var pct=p.days?Math.round(v/p.days*100):0;
     return '<div class="bar"><span>'+PMETA[k][1]+' '+PMETA[k][0]+'</span><span class="tk"><i data-w="'+pct+'"></i></span><span class="vv">'+v+'</span></div>';}).join('');
   var heat=(p.recent||[]).map(function(x){ return '<i class="c'+(x.count||0)+'" title="'+h(x.day)+': '+x.count+'/5"></i>'; }).join('');
@@ -584,7 +715,6 @@ function detailHTML(d){
     '<div class="kv"><span>Days tracked</span><b class="mono">'+(p.days||0)+'</b></div>'+
     '<div class="kv"><span>Best streak</span><b class="mono">'+(p.streakBest||0)+' days 🔥</b></div>'+
     (heat?'<div class="heat" title="last 21 days">'+heat+'</div>':'')+'</div>';
-  // learning panel
   var lvlPct=Math.min(100,(l.xp||0)%100);
   var chip=function(em,val,lab){ return '<div class="chip"><b data-c="'+(Number(val)||0)+'">0</b><span><span class="em">'+em+'</span>'+lab+'</span></div>'; };
   var learnHTML='<div class="panel"><div class="ptitle">🌱 Learning &amp; growth</div>'+
@@ -592,14 +722,12 @@ function detailHTML(d){
     '<div class="xpbar"><i data-w="'+lvlPct+'"></i></div>'+
     '<div class="dim" style="font-size:11px;margin:5px 0 12px">'+(l.xp||0)+' XP total</div>'+
     '<div class="chips">'+chip('📿',l.dhikr,'Dhikr')+chip('🔖',l.bookmarks,'Bookmarks')+chip('🤲',l.duas,'Duʿaʾ unlocked')+chip('📖',l.adhkar,'Adhkar')+chip('🏅',l.achievements,'Badges')+chip('🔥',p.streakBest,'Best streak')+'</div></div>';
-  // journal panel
   var jHTML='<div class="panel'+(VEIL?' veiled':'')+'" id="jp-'+h(d.key)+'"><div class="ptitle">📓 Journal <span class="dim" style="text-transform:none;letter-spacing:0">('+(d.journal?d.journal.length:0)+')</span></div>'+
     ((d.journal&&d.journal.length)? d.journal.slice(0,12).map(function(e){
       return '<div class="jitem"><div class="jhead"><span>'+when(e.date)+'</span><span class="mood">'+(e.mood?h(e.mood):'')+'</span></div>'+
         '<div class="jtext">'+(e.text?h(e.text):'<span class="dim">—</span>')+'</div></div>';
     }).join('')+(d.journal.length>12?'<div class="dim" style="font-size:12px">+'+(d.journal.length-12)+' more…</div>':'')
       : '<div class="empty">No journal entries yet.</div>')+'</div>';
-  // meta line
   var meta='<div class="panel"><div class="ptitle">🪪 Profile</div>'+
     '<div class="kv"><span>Display name</span><b>'+(d.name?h(d.name):'<span class="dim">—</span>')+'</b></div>'+
     '<div class="kv"><span>Email</span><b>'+(d.email?h(d.email):'<span class="dim">none</span>')+'</b></div>'+
@@ -619,13 +747,11 @@ function animateDetail(key){
   din.querySelectorAll('.tk i[data-w],.xpbar i[data-w]').forEach(function(i){ i.style.width=i.getAttribute('data-w')+'%'; });
   din.querySelectorAll('.chip b[data-c]').forEach(function(b){ countUp(b,b.getAttribute('data-c')); });
 }
-
 function toggleVeil(){
   VEIL=!VEIL;
   document.getElementById('veilT').classList.toggle('on',!VEIL);
   document.querySelectorAll('.panel[id^="jp-"]').forEach(function(p){ p.classList.toggle('veiled',VEIL); });
 }
-
 async function raw(key){
   var r=await fetch('/admin/api/user/'+encodeURIComponent(key)+'/raw');
   var j=await r.json();
@@ -653,7 +779,11 @@ async function del(key){
   delete OPEN[key]; delete DET[key]; load();
 }
 async function logout(){ await fetch('/admin/logout',{method:'POST'}); location.href='/admin'; }
-load();
+load(true);
+// Live auto-refresh: a new signup persists on the server instantly, so poll every 10s and re-render
+// ONLY when the data actually changed — new users appear here on their own, no manual refresh, no flicker.
+setInterval(function(){ if(document.visibilityState==='visible') load(false); }, 10000);
+document.addEventListener('visibilitychange', function(){ if(document.visibilityState==='visible') load(false); });
 </script>`);
 }
 
