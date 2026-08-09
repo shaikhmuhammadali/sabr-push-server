@@ -45,6 +45,7 @@ try { ({ alertTelegram } = require('./alert')); } catch (_) { /* telegram alerts
 //      SMTP (a paid Render instance, or self-hosting).
 // With neither configured, the email-reset routes report they're not set up (the app still
 // works fully offline/on-device; only the "email me a code" convenience is unavailable).
+const RESEND_API_KEY = process.env.RESEND_API_KEY || '';   // Resend HTTPS API — best deliverability; https://resend.com
 const BREVO_API_KEY = process.env.BREVO_API_KEY || '';
 let mailer = null;
 const MAIL_FROM = process.env.MAIL_FROM || process.env.SMTP_USER || '';
@@ -66,36 +67,51 @@ const FROM = (() => {
     });
   } catch (e) { console.error('[mail] nodemailer not installed:', e.message); }
 })();
-const MAIL_ENABLED = () => !!(BREVO_API_KEY && FROM.email) || !!mailer;
-console.log('[mail] ' + (BREVO_API_KEY && FROM.email
-  ? 'Brevo API configured — email password reset is ON (from ' + FROM.email + ')'
-  : mailer ? 'SMTP configured — email password reset is ON'
-  : 'no email transport set — "email me a code" reset is OFF'));
+// Which transport is active, in priority order. Exposed on /health for diagnosis.
+const MAIL_PROVIDER = () => (RESEND_API_KEY && FROM.email) ? 'resend'
+  : (BREVO_API_KEY && FROM.email) ? 'brevo'
+  : mailer ? 'smtp' : 'none';
+const MAIL_ENABLED = () => MAIL_PROVIDER() !== 'none';
+console.log('[mail] provider=' + MAIL_PROVIDER() + (FROM.email ? ' from=' + FROM.email : '')
+  + (MAIL_ENABLED() ? ' — email password reset is ON' : ' — "email me a code" reset is OFF (set RESEND_API_KEY or BREVO_API_KEY + MAIL_FROM)'));
 
 // Send one email (plaintext + optional HTML). Prefers the Brevo HTTPS API, falls back to SMTP.
 // Throws on failure so callers can decide whether that's fatal. Bounded by a 15s timeout so a
 // stalled network surfaces as a clean error instead of hanging the whole HTTP request.
+async function _fetchTimeout(url, opts, ms) {
+  const ctrl = new AbortController(); const timer = setTimeout(() => ctrl.abort(), ms || 15000);
+  try { return await fetch(url, Object.assign({}, opts, { signal: ctrl.signal })); }
+  finally { clearTimeout(timer); }
+}
 async function sendMailRaw({ to, subject, text, html }) {
-  if (BREVO_API_KEY && FROM.email) {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 15000);
-    try {
-      const res = await fetch('https://api.brevo.com/v3/smtp/email', {
-        method: 'POST',
-        headers: { 'api-key': BREVO_API_KEY, 'content-type': 'application/json', 'accept': 'application/json' },
-        body: JSON.stringify(Object.assign(
-          { sender: FROM, to: [{ email: to }], subject, textContent: text },
-          html ? { htmlContent: html } : {})),
-        signal: ctrl.signal,
-      });
-      if (!res.ok) {
-        const body = await res.text().catch(() => '');
-        throw new Error('Brevo ' + res.status + ': ' + body.slice(0, 300));
-      }
-    } finally { clearTimeout(timer); }
+  // 1) Resend HTTPS API — best deliverability; the `from` must be a Resend-verified sender/domain.
+  if (RESEND_API_KEY && FROM.email) {
+    const res = await _fetchTimeout('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { authorization: 'Bearer ' + RESEND_API_KEY, 'content-type': 'application/json' },
+      body: JSON.stringify(Object.assign(
+        { from: (FROM.name ? FROM.name + ' <' + FROM.email + '>' : FROM.email), to: [to], reply_to: FROM.email, subject },
+        text ? { text } : {}, html ? { html } : {})),
+    });
+    if (!res.ok) { const b = await res.text().catch(() => ''); throw new Error('Resend ' + res.status + ': ' + b.slice(0, 300)); }
+    const j = await res.json().catch(() => ({})); console.log('[mail] sent via resend id=' + (j.id || '?') + ' to=' + maskEmail(to));
     return;
   }
-  if (mailer) { await mailer.sendMail({ from: MAIL_FROM, to, subject, text, html }); return; }
+  // 2) Brevo HTTPS API — port 443, works even where SMTP is blocked (Render free tier).
+  if (BREVO_API_KEY && FROM.email) {
+    const res = await _fetchTimeout('https://api.brevo.com/v3/smtp/email', {
+      method: 'POST',
+      headers: { 'api-key': BREVO_API_KEY, 'content-type': 'application/json', 'accept': 'application/json' },
+      body: JSON.stringify(Object.assign(
+        { sender: FROM, to: [{ email: to }], replyTo: { email: FROM.email }, subject, textContent: text },
+        html ? { htmlContent: html } : {})),
+    });
+    if (!res.ok) { const b = await res.text().catch(() => ''); throw new Error('Brevo ' + res.status + ': ' + b.slice(0, 300)); }
+    const j = await res.json().catch(() => ({})); console.log('[mail] sent via brevo id=' + (j.messageId || '?') + ' to=' + maskEmail(to));
+    return;
+  }
+  // 3) SMTP via nodemailer (paid host / self-host).
+  if (mailer) { const info = await mailer.sendMail({ from: MAIL_FROM, to, subject, text, html }); console.log('[mail] sent via smtp id=' + ((info && info.messageId) || '?')); return; }
   throw new Error('no mail transport configured');
 }
 
@@ -246,7 +262,14 @@ app.get('/', (req, res) => res.type('text').send(
 
 app.get('/health', (req, res) => res.json({
   ok: true, tts: true, push: PUSH_ENABLED, auth: true, emailReset: MAIL_ENABLED(), subs: Object.keys(subs).length,
-  users: Object.keys(accounts.users).length, time: new Date().toISOString(),
+  users: Object.keys(accounts.users).length,
+  // Surfaced so a broken setup is never invisible again:
+  //   durable=false ⇒ accounts are on EPHEMERAL storage and are WIPED on every restart/redeploy — set DATABASE_URL.
+  //   mailProvider tells which email transport is live (resend|brevo|smtp|none).
+  storeKind: (typeof store !== 'undefined' && store && store.kind) || 'unknown',
+  durable: !!(typeof store !== 'undefined' && store && /pg|postgres/i.test(String(store.kind))),
+  mailProvider: MAIL_PROVIDER(), mailFrom: FROM.email || null,
+  time: new Date().toISOString(),
 }));
 
 /* ── 1) VOICE: /tts — the "recite everything" endpoint (zero-config) ──────────── */
@@ -829,6 +852,7 @@ require('./admin').mountAdmin(app, {
   analytics,
   USERS_STORE, STORE,
   PUSH_ENABLED, MAIL_ENABLED,
+  mailProvider: MAIL_PROVIDER, mailFrom: () => FROM.email, sendMailRaw,
   storeKind: store.kind, storeDescribe: () => store.describe(),
 });
 
