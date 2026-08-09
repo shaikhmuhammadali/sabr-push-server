@@ -311,8 +311,11 @@ function mountAdmin(app, ctx) {
     if (typeof ctx.revokeTokens === 'function') ctx.revokeTokens(key, null);
     else {
       for (const th of Object.keys(ctx.accounts.tokens)) if (ctx.accounts.tokens[th].u === key) delete ctx.accounts.tokens[th];
-      ctx.saveAccounts();
     }
+    // Always persist. revokeTokens() only mutates the in-memory token table; without this save the
+    // eviction is lost on the next restart (on Postgres a normal /auth/sync never rewrites the tokens
+    // row), so a "signed-out-everywhere" session silently resurrects. Matches the delete handler below.
+    ctx.saveAccounts();
     res.json({ ok: true });
   });
 
