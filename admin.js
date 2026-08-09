@@ -274,6 +274,26 @@ function mountAdmin(app, ctx) {
   app.get('/admin', gate, (req, res) => res.type('html').send(dashboardPage()));
   app.get('/admin/api/snapshot', gate, (req, res) => res.json(snapshot()));
 
+  // Live email diagnostic: sends a REAL test email through the active transport and returns the exact
+  // provider result — so a "reset email not arriving" problem is finally visible. Admin-gated.
+  //   curl -X POST .../admin/api/mail-diag -H 'Content-Type: application/json' \
+  //        -H 'Cookie: <admin session>' --data '{"to":"you@example.com"}'
+  app.post('/admin/api/mail-diag', gate, async (req, res) => {
+    const provider = (typeof ctx.mailProvider === 'function' ? ctx.mailProvider() : 'unknown');
+    const from = (typeof ctx.mailFrom === 'function' ? ctx.mailFrom() : null);
+    const to = String((req.body && req.body.to) || from || '').trim();
+    if (!to) return res.status(400).json({ ok: false, provider, from, error: 'pass {"to":"you@example.com"}' });
+    if (typeof ctx.sendMailRaw !== 'function') return res.status(500).json({ ok: false, provider, from, error: 'mail transport not wired' });
+    try {
+      await ctx.sendMailRaw({ to, subject: 'Sirat Khushu — email delivery test',
+        text: 'This is a test from the admin mail diagnostic. If you received it, password-reset emails will arrive too.',
+        html: '<p>This is a <b>test</b> from the admin mail diagnostic. If you received it, password-reset emails will arrive too. ✅</p>' });
+      res.json({ ok: true, provider, from, to, note: 'Provider ACCEPTED the send. Check the inbox AND spam. Final delivery status is in your provider dashboard.' });
+    } catch (e) {
+      res.status(502).json({ ok: false, provider, from, to, error: String((e && e.message) || e).slice(0, 400) });
+    }
+  });
+
   // Curated deep-dive for ONE user (prayer/journal/learning/password status).
   app.get('/admin/api/user/:key/detail', gate, (req, res) => {
     const key = String(req.params.key).toLowerCase();
