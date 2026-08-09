@@ -451,6 +451,12 @@ app.post('/auth/signup', signupLimiter, authLimiter, authGuard, async (req, res)
     // Optional recovery question — lets a user reset their password on a NEW device (where the
     // local security answer isn't available). Stored like a password: server-salted scrypt hash.
     await attachRecovery(rec, secQ, secA);
+    // Re-check AFTER the await-heavy hashing above. Two concurrent signups for the SAME name can both
+    // clear the earlier uniqueness guard before either assigns (Node yields at each await), and the second
+    // would overwrite the first — binding the first user's already-issued token to the second's record.
+    // No await separates this re-check from the synchronous write, so it closes the TOCTOU window: the
+    // loser 409s before any token is issued.
+    if (has(accounts.users, key)) return res.status(409).json({ error: 'username taken' });
     accounts.users[key] = rec;
     saveUser(key);
     const token = issueToken(key);
