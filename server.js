@@ -545,8 +545,10 @@ app.post('/auth/forgot-email', authLimiter, authGuard, async (req, res) => {
         u.resetCode = { hash: sha256hex(code), exp: now + 15 * 60000, tries: 0, sentAt: now };
         g.lastSentAt = now; g.dayCount = (g.dayCount || 0) + 1;
         saveUser(uKey);
-        try {
-          await sendMailRaw({
+        // Fire-and-forget: do NOT await the outbound email on the response path, and never surface a send
+        // error to the client. Awaiting (and 502-ing on failure) ONLY for registered addresses leaked account
+        // existence via response latency + status code — this endpoint is meant to be enumeration-safe.
+        sendMailRaw({
             to: u.email,
             subject: 'Your Sirat Khushu password reset code',
             text: 'Assalamu alaikum,\n\nYour password reset code is: ' + code + '\n\nIt expires in 15 minutes. If you did not request this, you can safely ignore this email.',
@@ -555,8 +557,7 @@ app.post('/auth/forgot-email', authLimiter, authGuard, async (req, res) => {
               '<p style="color:#c8c2b0;line-height:1.6;font-size:14px">Assalamu alaikum, use this code to reset your Sirat Khushu password:</p>' +
               '<div style="font-size:34px;font-weight:800;letter-spacing:.3em;color:#f4ecd8;margin:14px 0;padding:14px;background:rgba(217,180,91,.08);border:1px solid rgba(217,180,91,.25);border-radius:12px">' + code + '</div>' +
               '<p style="color:#8a94a6;font-size:12px">It expires in 15 minutes. If you didn&rsquo;t request this, you can safely ignore this email.</p></div>',
-          });
-        } catch (e) { console.error('[mail] send failed:', e.message); return res.status(502).json({ error: 'could not send the email right now — please try again shortly' }); }
+        }).catch(function (e) { console.error('[mail] send failed:', e.message); });
       }
     }
     // Generic response — never reveal whether the email is registered. The app shows the address the user typed.
