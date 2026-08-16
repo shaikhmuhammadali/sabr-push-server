@@ -220,29 +220,43 @@ function pgBackend(paths) {
 /* ── dirty-tracking writer shared by both backends ─────────────────────────────── */
 function makeTracker(flushFn) {
   let users = new Set(), deleted = new Set(), tokens = false, all = false;
-  let timer = null, writing = false, again = false;
+  let timer = null, writing = false, again = false, inflight = null, firstMarkAt = 0;
+  // Max-wait cap: a pure resettable debounce can be STARVED forever under steady write traffic
+  // (>1 mark / DEBOUNCE_MS), so once marks have been buffered for MAX_WAIT we flush regardless.
+  const MAX_WAIT = Math.max(DEBOUNCE_MS, 3000);
 
   async function flush() {
-    if (writing) { again = true; return; }
+    // Already writing → let the caller (e.g. the SIGTERM shutdown flush) AWAIT the in-flight write
+    // instead of returning a resolved promise immediately and losing the last write on exit.
+    if (writing) { again = true; return inflight; }
     if (!users.size && !deleted.size && !tokens && !all) return;
+    clearTimeout(timer); timer = null; firstMarkAt = 0;
     // snapshot + reset first, so edits made during the await are not lost
     const dirty = { users, deleted, tokens, all };
     users = new Set(); deleted = new Set(); tokens = false; all = false;
     writing = true;
-    try { await flushFn(dirty); }
-    catch (e) {
-      console.error('[store] write failed:', e.message);
-      // put the work back so the next flush retries it rather than dropping data
-      for (const k of dirty.users) users.add(k);
-      for (const k of dirty.deleted) deleted.add(k);
-      tokens = tokens || dirty.tokens; all = all || dirty.all;
-    }
-    finally {
-      writing = false;
-      if (again) { again = false; flush(); }
-    }
+    inflight = (async () => {
+      try { await flushFn(dirty); }
+      catch (e) {
+        console.error('[store] write failed:', e.message);
+        // put the work back so the next flush retries it rather than dropping data
+        for (const k of dirty.users) users.add(k);
+        for (const k of dirty.deleted) deleted.add(k);
+        tokens = tokens || dirty.tokens; all = all || dirty.all;
+        schedule();   // re-arm: a QUIET store (no further activity) must still retry a failed write
+      }
+      finally {
+        writing = false;
+        if (again) { again = false; await flush(); }   // drain marks buffered during the write (awaited, so shutdown persists them too)
+      }
+    })();
+    return inflight;
   }
-  const schedule = () => { clearTimeout(timer); timer = setTimeout(flush, DEBOUNCE_MS); };
+  const schedule = () => {
+    if (!firstMarkAt) firstMarkAt = Date.now();
+    if (Date.now() - firstMarkAt >= MAX_WAIT) { flush(); return; }   // starvation cap
+    clearTimeout(timer); timer = setTimeout(flush, DEBOUNCE_MS);
+  };
 
   return {
     markKey(k) { users.add(k); deleted.delete(k); schedule(); },
