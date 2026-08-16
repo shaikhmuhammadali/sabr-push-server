@@ -666,6 +666,19 @@ app.post('/auth/logout', (req, res) => {
   res.json({ ok: true });
 });
 
+// Self-service account erasure (GDPR Art. 17 "right to be forgotten"). Authenticated by the caller's own
+// bearer token, so a user can only ever delete THEIR account — never someone else's. Wipes the account
+// record, its stored cloud blob, and every signed-in session across all devices, in memory and durably.
+app.post('/auth/delete', authLimiter, authGuard, (req, res) => {
+  const a = userFromReq(req);
+  if (!a) return res.status(401).json({ error: 'invalid or expired token' });
+  revokeTokens(a.key, null);            // evict every session for this account (keepHash=null → keep none)
+  delete accounts.users[a.key];         // erase the account (username, password hash, email, data blob) from memory
+  store.deleteUser(a.key);              // …and drop its durable row
+  saveTokens();                         // persist the session eviction
+  res.json({ ok: true });
+});
+
 /* ── 3) PUSH: only meaningful when VAPID keys are set ─────────────────────────── */
 function requirePush(req, res) {
   if (!PUSH_ENABLED) { res.status(503).json({ error: 'push disabled — set VAPID keys to enable background reminders' }); return false; }
@@ -723,25 +736,49 @@ app.post('/unsubscribe', writeLimiter, (req, res) => {
 
 // ── scheduler: fire everything due. Internal every 60s + /tick for external cron ──
 let _ticking = false;
+const PUSH_TIMEOUT_MS = 5000;   // a single hung push service can't stall the whole tick
+const PUSH_CONCURRENCY = 25;    // sends per wave — bounds fan-out so we don't open thousands of sockets at once
+// One send, but never allowed to hang: whichever settles first — the real send or the timeout — wins.
+function sendPush(subscription, payload) {
+  let t;
+  const timeout = new Promise((_, rej) => { t = setTimeout(() => rej(Object.assign(new Error('push timeout'), { _timeout: true })), PUSH_TIMEOUT_MS); });
+  return Promise.race([webpush.sendNotification(subscription, payload), timeout]).finally(() => clearTimeout(t));
+}
 async function tick() {
   if (!PUSH_ENABLED || _ticking) return;
   _ticking = true;
   try {
     const now = Date.now();
-    const dead = [];
+    const dead = new Set();
     const touched = new Set();                 // only these rows get rewritten
+    // 1) Collect every due (endpoint,item) pair up front and mark it fired NOW, so this pass owns it and
+    //    a re-entrant/overlapping tick can't double-send the same reminder.
+    const jobs = [];
     for (const ep of Object.keys(subs)) {
       const rec = subs[ep];
       if (!rec || !Array.isArray(rec.schedule)) continue;
-      const due = rec.schedule.filter((s) => !s.fired && s.ts <= now && s.ts > now - 15 * 60000);
-      for (const item of due) {
-        item.fired = true; touched.add(ep);
-        try {
-          await webpush.sendNotification(rec.subscription, JSON.stringify({ title: item.title, body: item.body, tag: item.tag }));
-        } catch (err) {
-          if (err && (err.statusCode === 404 || err.statusCode === 410)) { dead.push(ep); break; }
+      for (const item of rec.schedule) {
+        if (!item.fired && item.ts <= now && item.ts > now - 15 * 60000) {
+          item.fired = true; touched.add(ep);
+          jobs.push({ ep, rec, payload: JSON.stringify({ title: item.title, body: item.body, tag: item.tag }) });
         }
       }
+    }
+    // 2) Dispatch in bounded-concurrency waves with a per-send timeout. The old serial `await` loop took
+    //    N × round-trip and one dead endpoint's TCP timeout could blow past the 60s tick, starving everyone
+    //    after it. This makes wall-time ≈ (N / PUSH_CONCURRENCY) × RTT and isolates every slow endpoint.
+    for (let i = 0; i < jobs.length; i += PUSH_CONCURRENCY) {
+      const wave = jobs.slice(i, i + PUSH_CONCURRENCY);
+      await Promise.allSettled(wave.map((j) =>
+        sendPush(j.rec.subscription, j.payload).catch((err) => {
+          if (err && (err.statusCode === 404 || err.statusCode === 410)) dead.add(j.ep);   // endpoint gone → prune it
+          // timeouts / transient 5xx: leave fired=true (best-effort; the client re-uploads its schedule regularly)
+        })));
+    }
+    // 3) Prune spent items (>1h old) and dead endpoints, then persist only the rows we touched.
+    for (const ep of Object.keys(subs)) {
+      const rec = subs[ep];
+      if (!rec || !Array.isArray(rec.schedule)) continue;
       const before = rec.schedule.length;
       rec.schedule = rec.schedule.filter((s) => s.ts > now - 60 * 60000); // prune >1h old
       if (rec.schedule.length !== before) touched.add(ep);
