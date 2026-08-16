@@ -199,11 +199,17 @@ function mountAdmin(app, ctx) {
   }
 
   function snapshot() {
+    // Precompute per-user device (token) counts in ONE O(T) pass — the old per-user filter scanned the
+    // ENTIRE token table for EVERY user (O(users x tokens), quadratic) on this ~10s-polled admin path.
+    const tokCount = Object.create(null);
+    for (const th of Object.keys(ctx.accounts.tokens || {})) {
+      const rec = ctx.accounts.tokens[th];
+      if (rec && rec.u) tokCount[rec.u] = (tokCount[rec.u] || 0) + 1;
+    }
     const users = Object.keys(ctx.accounts.users).map((key) => {
       const u = ctx.accounts.users[key];
       const st = statsFor(u);
-      const tokens = Object.keys(ctx.accounts.tokens || {})
-        .filter((th) => ctx.accounts.tokens[th] && ctx.accounts.tokens[th].u === key).length;
+      const tokens = tokCount[key] || 0;
       return {
         key, username: u.username || key, email: u.email || null,
         createdAt: u.createdAt || null, updatedAt: u.updatedAt || null, rev: u.rev || 0,
