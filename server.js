@@ -744,9 +744,21 @@ function sendPush(subscription, payload) {
   const timeout = new Promise((_, rej) => { t = setTimeout(() => rej(Object.assign(new Error('push timeout'), { _timeout: true })), PUSH_TIMEOUT_MS); });
   return Promise.race([webpush.sendNotification(subscription, payload), timeout]).finally(() => clearTimeout(t));
 }
+/* Real delivery telemetry. Reminders are the one feature that fails SILENTLY — a user simply never
+   gets their adhan and nobody finds out. These counters are the ground truth the admin portal shows,
+   so a broken push path is visible instead of invisible. In-memory only (cheap, resets on restart);
+   `recent` keeps the last 30 runs for the sparkline. */
+const pushStats = {
+  runs: 0, lastRun: null, lastDurationMs: 0,
+  last: { due: 0, sent: 0, failed: 0, timedOut: 0, dead: 0 },
+  total: { sent: 0, failed: 0, timedOut: 0, dead: 0 },
+  recent: [],   // [{ t, sent, failed, ms }] — newest last, capped at 30
+};
 async function tick() {
   if (!PUSH_ENABLED || _ticking) return;
   _ticking = true;
+  const _t0 = Date.now();
+  let _sent = 0, _failed = 0, _timedOut = 0, _due = 0, _deadCount = 0;
   try {
     const now = Date.now();
     const dead = new Set();
@@ -770,7 +782,9 @@ async function tick() {
     for (let i = 0; i < jobs.length; i += PUSH_CONCURRENCY) {
       const wave = jobs.slice(i, i + PUSH_CONCURRENCY);
       await Promise.allSettled(wave.map((j) =>
-        sendPush(j.rec.subscription, j.payload).catch((err) => {
+        sendPush(j.rec.subscription, j.payload).then(() => { _sent++; }, (err) => {
+          _failed++;
+          if (err && err._timeout) _timedOut++;
           if (err && (err.statusCode === 404 || err.statusCode === 410)) dead.add(j.ep);   // endpoint gone → prune it
           // timeouts / transient 5xx: leave fired=true (best-effort; the client re-uploads its schedule regularly)
         })));
@@ -785,7 +799,20 @@ async function tick() {
     }
     dead.forEach((ep) => { delete subs[ep]; touched.delete(ep); store.deleteSub(ep); });
     for (const ep of touched) store.saveSub(ep);
-  } finally { _ticking = false; }
+    _due = jobs.length; _deadCount = dead.size;
+  } finally {
+    _ticking = false;
+    // Record what this pass actually did, so the admin portal can show real delivery health.
+    const ms = Date.now() - _t0;
+    pushStats.runs++; pushStats.lastRun = Date.now(); pushStats.lastDurationMs = ms;
+    pushStats.last = { due: _due, sent: _sent, failed: _failed, timedOut: _timedOut, dead: _deadCount };
+    pushStats.total.sent += _sent; pushStats.total.failed += _failed;
+    pushStats.total.timedOut += _timedOut; pushStats.total.dead += _deadCount;
+    if (_due > 0) {   // only record runs that actually had work — an idle minute isn't a data point
+      pushStats.recent.push({ t: Date.now(), sent: _sent, failed: _failed, ms });
+      if (pushStats.recent.length > 30) pushStats.recent.shift();
+    }
+  }
 }
 const tickLimiter = rateLimit({ windowMs: 60 * 1000, max: 6, standardHeaders: true, legacyHeaders: false });   // the internal 60s interval covers normal operation; keep the public trigger tight
 app.all('/tick', tickLimiter, async (req, res) => { if (!guard(req, res)) return; await tick().catch((e) => console.error('[tick]', e.message)); res.json({ ok: true, at: Date.now() }); });
@@ -892,6 +919,8 @@ require('./admin').mountAdmin(app, {
   PUSH_ENABLED, MAIL_ENABLED,
   mailProvider: MAIL_PROVIDER, mailFrom: () => FROM.email, sendMailRaw,
   storeKind: store.kind, storeDescribe: () => store.describe(),
+  pushStats,                       // real push-delivery telemetry (see tick()) — powers the Operations panel
+  MAX_ACCOUNTS,                    // so the portal can show how close signups are to the ceiling
 });
 
 // ── 404 + error handler (never leak internals) ────────────────────────────────

@@ -104,7 +104,7 @@ function mountAdmin(app, ctx) {
   // ── data shaping ───────────────────────────────────────────────────────────
   // Light per-user stats for the table (no private text).
   function statsFor(u) {
-    const out = { bytes: 0, prayerDays: 0, prayerLogs: 0, journal: 0, dhikr: 0, bookmarks: 0, parsed: false };
+    const out = { bytes: 0, prayerDays: 0, prayerLogs: 0, journal: 0, dhikr: 0, bookmarks: 0, streak: 0, parsed: false };
     if (!u || !u.data) return out;
     out.bytes = Buffer.byteLength(u.data);
     try {
@@ -119,6 +119,7 @@ function mountAdmin(app, ctx) {
         if (Array.isArray(d.journal)) out.journal = d.journal.length;
         out.dhikr = Number(d.dhikrTotal) || 0;
         if (Array.isArray(d.bookmarks)) out.bookmarks = d.bookmarks.length;
+        out.streak = Number(d.streakBest) || 0;   // the app's own best-streak value (same field the per-user detail reads)
       }
     } catch (_) { /* unreadable — byte size only */ }
     return out;
@@ -256,8 +257,112 @@ function mountAdmin(app, ctx) {
         durable: ctx.storeKind === 'postgres',   // false = ephemeral (accounts wiped on restart/sleep)
         uptimeSec: Math.floor(process.uptime()), node: process.version,
         now: new Date().toISOString(),
+        ...vitals(),
       },
+      delivery: deliveryHealth(),
+      retention: retentionCohorts(users),
+      devotion: devotionStats(users),
+      alerts: alerts(users),
     };
+  }
+
+  /* ── Operations intelligence ────────────────────────────────────────────────────
+     Everything below is derived from data the server ACTUALLY holds — process metrics,
+     the real push-tick counters, and account timestamps. Nothing is estimated or faked;
+     when a source genuinely has no data yet, the panel says so rather than inventing a number. */
+
+  // Live process vitals. Memory matters on the free tier (512 MB) — an OOM restart on FILE
+  // storage silently wipes every account, so surfacing headroom is a real safety signal.
+  function vitals() {
+    let mem = null;
+    try {
+      const m = process.memoryUsage();
+      mem = { rss: m.rss, heapUsed: m.heapUsed, heapTotal: m.heapTotal, limitMB: 512 };
+    } catch (_) {}
+    return { mem, pid: process.pid, platform: process.platform };
+  }
+
+  // Push delivery health from the real tick() counters. Reminders are the one feature that fails
+  // silently, so this is the difference between "reminders are broken" being visible or invisible.
+  function deliveryHealth() {
+    const p = ctx.pushStats;
+    if (!p) return { available: false };
+    const t = p.total || {};
+    const attempted = (t.sent || 0) + (t.failed || 0);
+    const subsAll = Object.values(ctx.subs || {});
+    let pending = 0, scheduled = 0;
+    for (const s of subsAll) {
+      const sch = Array.isArray(s && s.schedule) ? s.schedule : [];
+      scheduled += sch.length;
+      pending += sch.filter((x) => x && !x.fired).length;
+    }
+    return {
+      available: true,
+      enabled: Boolean(ctx.PUSH_ENABLED),
+      runs: p.runs || 0,
+      lastRun: p.lastRun || null,
+      lastDurationMs: p.lastDurationMs || 0,
+      last: p.last || {},
+      total: t,
+      // successRate is null (not 0) until something has actually been attempted — never imply failure from no data
+      successRate: attempted ? Math.round(((t.sent || 0) / attempted) * 1000) / 10 : null,
+      recent: p.recent || [],
+      subscriptions: subsAll.length,
+      scheduled, pending,
+    };
+  }
+
+  // Weekly retention: of the accounts created in week N, how many are still syncing (updatedAt)?
+  // Real signal for whether the app keeps people, computed purely from timestamps we already store.
+  function retentionCohorts(users) {
+    const now = Date.now(), WEEK = 7 * 86400000;
+    const out = [];
+    for (let w = 5; w >= 0; w--) {
+      const start = now - (w + 1) * WEEK, end = now - w * WEEK;
+      const cohort = users.filter((u) => (u.createdAt || 0) >= start && (u.createdAt || 0) < end);
+      const active = cohort.filter((u) => (u.updatedAt || 0) > now - 2 * WEEK).length;
+      out.push({
+        weeksAgo: w, size: cohort.length, retained: active,
+        pct: cohort.length ? Math.round((active / cohort.length) * 100) : null,
+      });
+    }
+    return out;
+  }
+
+  // What the app is actually FOR. Prayer completion = logged prayers vs the 5-a-day opportunity
+  // across the days each user has tracked — the truest measure of whether the app is helping.
+  function devotionStats(users) {
+    const days = users.reduce((n, u) => n + (u.stats.prayerDays || 0), 0);
+    const logs = users.reduce((n, u) => n + (u.stats.prayerLogs || 0), 0);
+    const streaks = users.map((u) => u.stats.streak || 0).filter((n) => n > 0);
+    return {
+      prayerDays: days, prayerLogs: logs,
+      completion: days ? Math.round((logs / (days * 5)) * 1000) / 10 : null,   // null = nothing tracked yet
+      bestStreak: streaks.length ? Math.max(...streaks) : 0,
+      avgStreak: streaks.length ? Math.round((streaks.reduce((a, b) => a + b, 0) / streaks.length) * 10) / 10 : 0,
+      engaged: users.filter((u) => (u.stats.prayerLogs || 0) > 0).length,
+    };
+  }
+
+  // Actionable warnings, worst first. Each one is a real condition with a real consequence —
+  // no cosmetic "all good" noise, and every item tells the owner what to DO about it.
+  function alerts(users) {
+    const out = [];
+    const durable = ctx.storeKind === 'postgres';
+    if (!durable) out.push({ level: 'critical', title: 'Storage is not durable', body: 'Accounts live on an ephemeral disk and are WIPED on every restart, redeploy or sleep. Set DATABASE_URL to a Postgres connection string.' });
+    if (!ctx.PUSH_ENABLED) out.push({ level: 'warn', title: 'Push is disabled', body: 'No prayer reminders can be delivered. Set the VAPID keys to enable background reminders.' });
+    if (typeof ctx.MAIL_ENABLED === 'function' && !ctx.MAIL_ENABLED()) out.push({ level: 'warn', title: 'Email is disabled', body: 'Password reset by email cannot work. Set RESEND_API_KEY or BREVO_API_KEY + MAIL_FROM.' });
+    const p = ctx.pushStats;
+    if (p && p.total && (p.total.sent + p.total.failed) > 20) {
+      const rate = p.total.sent / (p.total.sent + p.total.failed);
+      if (rate < 0.9) out.push({ level: 'warn', title: 'Push delivery is degraded', body: Math.round(rate * 100) + '% of reminder sends are succeeding. Check the push service and prune dead endpoints.' });
+    }
+    if (ctx.MAX_ACCOUNTS && users.length >= ctx.MAX_ACCOUNTS * 0.8) {
+      out.push({ level: 'warn', title: 'Approaching the signup ceiling', body: users.length + ' of ' + ctx.MAX_ACCOUNTS + ' accounts used. New signups are refused at the cap.' });
+    }
+    const noEmail = users.filter((u) => !u.email).length;
+    if (users.length && noEmail / users.length > 0.5) out.push({ level: 'info', title: 'Most accounts have no email', body: noEmail + ' of ' + users.length + ' accounts cannot recover a forgotten password.' });
+    return out;
   }
 
   // ── routes ─────────────────────────────────────────────────────────────────
@@ -430,6 +535,47 @@ h2.sh .c{margin-left:auto;color:var(--dim);letter-spacing:.04em;font-size:.9em;t
 .kpi .l{color:var(--dim);font-size:.72rem;text-transform:uppercase;letter-spacing:.09em;margin-top:5px;font-weight:600}
 .kpi .t{font-size:.72rem;margin-top:9px;color:var(--green);display:flex;align-items:center;gap:5px}
 .kpi .t.flat{color:var(--dim)}
+/* ── alerts ── */
+.alert{display:flex;gap:13px;align-items:flex-start;padding:14px 16px;border-radius:14px;margin-bottom:11px;border:1px solid var(--line);background:var(--panel2);
+  opacity:0;transform:translateY(-8px);animation:rise .5s cubic-bezier(.2,.7,.2,1) forwards}
+.alert .ai{font-size:1.1rem;line-height:1.3;flex:none}
+.alert b{display:block;font-size:.93rem;margin-bottom:3px}
+.alert p{margin:0;color:var(--dim);font-size:.83rem;line-height:1.55}
+.alert.critical{border-color:#6b2733;background:linear-gradient(180deg,rgba(214,73,97,.13),transparent),var(--panel2)}
+.alert.critical b{color:#ff8a9e}
+.alert.critical .ai{animation:pulseA 1.9s ease-in-out infinite}
+.alert.warn{border-color:#5a4a1e;background:linear-gradient(180deg,rgba(230,193,105,.10),transparent),var(--panel2)}
+.alert.warn b{color:var(--gold)}
+.alert.info{border-color:var(--line2)}
+@keyframes pulseA{50%{transform:scale(1.16);opacity:.75}}
+/* ── gauge + meters ── */
+.opsgrid{display:grid;grid-template-columns:auto 1fr;gap:22px;align-items:center}
+@media(max-width:720px){.opsgrid{grid-template-columns:1fr}}
+.gauge{position:relative;width:132px;height:132px;flex:none}
+.gauge svg{transform:rotate(-90deg)}
+.gauge .gv{position:absolute;inset:0;display:grid;place-items:center;text-align:center}
+.gauge .gv b{font-size:1.5rem;font-weight:800;font-variant-numeric:tabular-nums;letter-spacing:-.02em}
+.gauge .gv span{display:block;font-size:.6rem;color:var(--dim);text-transform:uppercase;letter-spacing:.1em;margin-top:2px}
+.gring{stroke-dasharray:339.3;stroke-dashoffset:339.3;transition:stroke-dashoffset 1.1s cubic-bezier(.2,.7,.2,1)}
+.mrow{display:grid;grid-template-columns:118px 1fr auto;gap:12px;align-items:center;margin-bottom:11px;font-size:.83rem}
+.mrow .ml{color:var(--dim)}
+.mbar{height:8px;border-radius:99px;background:#0c1320;border:1px solid var(--line);overflow:hidden}
+.mbar i{display:block;height:100%;width:0;border-radius:99px;background:linear-gradient(90deg,var(--gold2),var(--gold));transition:width 1s cubic-bezier(.2,.7,.2,1)}
+.mbar i.g{background:linear-gradient(90deg,#2f9e6b,#48d39a)}
+.mbar i.r{background:linear-gradient(90deg,#a33b4e,#e0687f)}
+.mrow .mv{font-variant-numeric:tabular-nums;font-weight:700;min-width:66px;text-align:right}
+.statline{display:flex;flex-wrap:wrap;gap:10px;margin-top:16px}
+.stat{flex:1 1 118px;background:var(--panel2);border:1px solid var(--line);border-radius:12px;padding:11px 13px}
+.stat b{display:block;font-size:1.22rem;font-variant-numeric:tabular-nums;letter-spacing:-.02em}
+.stat span{font-size:.68rem;color:var(--dim);text-transform:uppercase;letter-spacing:.08em}
+/* ── cohort heatmap ── */
+.cohorts{display:flex;gap:9px;flex-wrap:wrap}
+.coh{flex:1 1 92px;border-radius:13px;border:1px solid var(--line);padding:13px 12px;text-align:center;background:var(--panel2);
+  opacity:0;transform:scale(.94);animation:pop .5s cubic-bezier(.2,.7,.2,1) forwards}
+@keyframes pop{to{opacity:1;transform:none}}
+.coh .cp{font-size:1.32rem;font-weight:800;font-variant-numeric:tabular-nums;letter-spacing:-.02em}
+.coh .cw{font-size:.66rem;color:var(--dim);text-transform:uppercase;letter-spacing:.08em;margin-top:5px}
+.coh .cn{font-size:.7rem;color:var(--dim);margin-top:3px}
 /* ── chart ── */
 .chart svg{display:block;width:100%}.chart svg text{fill:var(--dim);font-size:10px}
 /* ── tables ── */
@@ -540,6 +686,9 @@ function dashboardPage() {
       <div class="brand"><div class="logo">🌙</div><div><span class="bt">Sirat Khushu</span><span class="bs">Admin portal</span></div></div>
       <nav class="nav" id="nav">
         <a href="#s-overview" class="on"><span class="ni">◈</span> Overview</a>
+        <a href="#s-delivery"><span class="ni">📡</span> Delivery</a>
+        <a href="#s-devotion"><span class="ni">🕌</span> Devotion</a>
+        <a href="#s-retention"><span class="ni">📈</span> Retention</a>
         <a href="#s-accounts"><span class="ni">👤</span> Accounts</a>
         <a href="#s-subs"><span class="ni">🔔</span> Subscriptions</a>
         <a href="#s-server"><span class="ni">🖥️</span> Server</a>
@@ -569,9 +718,23 @@ function dashboardPage() {
         have a real reason to read them. Click any account row to open its full detail.
       </div>
 
+      <div id="alerts"></div>
+
       <section class="section" id="s-overview">
         <div class="kpis" id="kpis"></div>
         <div class="card chartcard"><h2 class="sh">New signups <span class="c">last 30 days · real</span></h2><div class="chart" id="signupsChart"></div></div>
+      </section>
+
+      <section class="section" id="s-delivery">
+        <div class="card"><h2 class="sh">Reminder delivery <span class="c">live from the scheduler · real</span></h2><div id="delivery"></div></div>
+      </section>
+
+      <section class="section" id="s-devotion">
+        <div class="card"><h2 class="sh">Devotion <span class="c">what the app is actually for</span></h2><div id="devotion"></div></div>
+      </section>
+
+      <section class="section" id="s-retention">
+        <div class="card"><h2 class="sh">Weekly retention <span class="c">signup cohorts · still syncing</span></h2><div id="retention"></div></div>
       </section>
 
       <section class="section" id="s-accounts">
@@ -607,7 +770,10 @@ async function load(force){
   var nd=await r.json();
   // change-signature: only re-render when something actually changed, so the auto-refresh never
   // flickers the table or interrupts a deep-dive the admin is reading.
-  var sig=nd.users.length+'|'+nd.totals.prayerLogs+'|'+nd.totals.journal+'|'+nd.subs.length+'|'+nd.totals.newToday+'|'+(nd.users[0]&&nd.users[0].updatedAt);
+  var _d=nd.delivery||{}, _dt=_d.total||{};
+  var sig=nd.users.length+'|'+nd.totals.prayerLogs+'|'+nd.totals.journal+'|'+nd.subs.length+'|'+nd.totals.newToday+'|'+(nd.users[0]&&nd.users[0].updatedAt)
+    // delivery telemetry moves independently of accounts — include it so the Delivery panel stays LIVE
+    +'|'+(_dt.sent||0)+'|'+(_dt.failed||0)+'|'+(_d.pending||0)+'|'+((nd.alerts||[]).length);
   D=nd; if(!force && sig===LAST_SIG){ return; } LAST_SIG=sig; var t=D.totals;
   var K=[
     ['Accounts',t.users,'👤','var(--gold)', (t.newWeek?('+'+t.newWeek+' this week'):'no new this week')],
@@ -674,10 +840,107 @@ async function load(force){
     ' &nbsp; Storage '+storage+
     '<br><br>'+h(s.storeDesc||'')+'<br>Node '+h(s.node)+' · up '+Math.floor(s.uptimeSec/3600)+'h '+(Math.floor(s.uptimeSec/60)%60)+'m · '+h(s.now)+
     warn;
+  try{ renderAlerts(D.alerts); }catch(e){}
+  try{ renderDelivery(D.delivery); }catch(e){}
+  try{ renderDevotion(D.devotion, t); }catch(e){}
+  try{ renderRetention(D.retention); }catch(e){}
   el_updated(s);
   spy();
 }
 function el_updated(s){ var u=document.getElementById('updated'); if(u) u.innerHTML='<span style="color:var(--green)">●</span> live · auto-refresh'; }
+
+/* ── Alerts: real conditions that need the owner to DO something ── */
+function renderAlerts(list){
+  var host=document.getElementById('alerts'); if(!host) return;
+  if(!list || !list.length){ host.innerHTML=''; return; }
+  var ic={critical:'⛔',warn:'⚠️',info:'ℹ️'};
+  host.innerHTML=list.map(function(a,i){
+    return '<div class="alert '+h(a.level)+'" style="animation-delay:'+(i*70)+'ms">'+
+      '<span class="ai">'+(ic[a.level]||'•')+'</span>'+
+      '<div><b>'+h(a.title)+'</b><p>'+h(a.body)+'</p></div></div>';
+  }).join('');
+}
+
+/* ── Reminder delivery: the one feature that fails silently, made visible ── */
+function renderDelivery(d){
+  var host=document.getElementById('delivery'); if(!host) return;
+  if(!d || !d.available){ host.innerHTML='<div class="empty">Delivery telemetry unavailable.</div>'; return; }
+  if(!d.enabled){ host.innerHTML='<div class="empty">Push is disabled — set the VAPID keys to deliver reminders.</div>'; return; }
+  var attempted=(d.total.sent||0)+(d.total.failed||0);
+  var rate=d.successRate;   // null until something has actually been attempted
+  var pct=(rate==null)?0:rate;
+  var col=(rate==null)?'var(--dim)':(rate>=95?'#48d39a':(rate>=80?'var(--gold)':'#e0687f'));
+  var C=2*Math.PI*54;
+  var gauge='<div class="gauge"><svg viewBox="0 0 120 120" width="132" height="132">'+
+    '<circle cx="60" cy="60" r="54" fill="none" stroke="#0c1320" stroke-width="11"/>'+
+    '<circle class="gring" cx="60" cy="60" r="54" fill="none" stroke="'+col+'" stroke-width="11" stroke-linecap="round" '+
+      'style="stroke-dasharray:'+C.toFixed(1)+';stroke-dashoffset:'+(C*(1-pct/100)).toFixed(1)+'"/>'+
+    '</svg><div class="gv"><b style="color:'+col+'">'+(rate==null?'—':rate+'%')+'</b><span>delivered</span></div></div>';
+  var m=function(label,val,max,cls){
+    var w=max?Math.min(100,Math.round(val/max*100)):0;
+    return '<div class="mrow"><span class="ml">'+label+'</span><span class="mbar"><i class="'+(cls||'')+'" style="width:'+w+'%"></i></span><span class="mv">'+val.toLocaleString()+'</span></div>';
+  };
+  var peak=Math.max(d.total.sent||0,d.total.failed||0,1);
+  var meters=m('Sent',d.total.sent||0,peak,'g')+m('Failed',d.total.failed||0,peak,'r')+
+             m('Timed out',d.total.timedOut||0,peak,'r')+m('Dead pruned',d.total.dead||0,peak);
+  var last=d.last||{};
+  host.innerHTML='<div class="opsgrid">'+gauge+'<div>'+meters+'</div></div>'+
+    '<div class="statline">'+
+      '<div class="stat"><b>'+(d.subscriptions||0).toLocaleString()+'</b><span>Subscribers</span></div>'+
+      '<div class="stat"><b>'+(d.pending||0).toLocaleString()+'</b><span>Pending</span></div>'+
+      '<div class="stat"><b>'+(d.scheduled||0).toLocaleString()+'</b><span>Scheduled</span></div>'+
+      '<div class="stat"><b>'+(d.lastDurationMs||0)+'ms</b><span>Last tick</span></div>'+
+      '<div class="stat"><b>'+(d.runs||0).toLocaleString()+'</b><span>Ticks run</span></div>'+
+    '</div>'+
+    '<div class="dim" style="font-size:12.5px;margin-top:13px">'+
+      (attempted?('Last pass: '+(last.due||0)+' due · '+(last.sent||0)+' sent · '+(last.failed||0)+' failed'):
+       'No reminders have come due yet — counters start once a scheduled prayer time passes.')+
+      (d.lastRun?(' · last run '+ago(d.lastRun)):'')+'</div>';
+}
+
+/* ── Devotion: prayer completion across every tracked day ── */
+function renderDevotion(v, t){
+  var host=document.getElementById('devotion'); if(!host) return;
+  if(!v){ host.innerHTML='<div class="empty">No devotion data yet.</div>'; return; }
+  if(v.completion==null){ host.innerHTML='<div class="empty">No prayers tracked yet — this fills in as people log their salah.</div>'; return; }
+  var col=v.completion>=80?'#48d39a':(v.completion>=50?'var(--gold)':'#e0687f');
+  var C=2*Math.PI*54;
+  var gauge='<div class="gauge"><svg viewBox="0 0 120 120" width="132" height="132">'+
+    '<circle cx="60" cy="60" r="54" fill="none" stroke="#0c1320" stroke-width="11"/>'+
+    '<circle class="gring" cx="60" cy="60" r="54" fill="none" stroke="'+col+'" stroke-width="11" stroke-linecap="round" '+
+      'style="stroke-dasharray:'+C.toFixed(1)+';stroke-dashoffset:'+(C*(1-v.completion/100)).toFixed(1)+'"/>'+
+    '</svg><div class="gv"><b style="color:'+col+'">'+v.completion+'%</b><span>kept</span></div></div>';
+  host.innerHTML='<div class="opsgrid">'+gauge+
+    '<div class="dim" style="font-size:13.5px;line-height:1.75">'+
+      '<b style="color:var(--text)">'+(v.prayerLogs||0).toLocaleString()+'</b> prayers kept across '+
+      '<b style="color:var(--text)">'+(v.prayerDays||0).toLocaleString()+'</b> tracked days.<br>'+
+      '<b style="color:var(--text)">'+(v.engaged||0).toLocaleString()+'</b> '+((v.engaged===1)?'person has':'people have')+' logged at least one prayer.'+
+    '</div></div>'+
+    '<div class="statline">'+
+      '<div class="stat"><b>'+(v.bestStreak||0)+'</b><span>Best streak</span></div>'+
+      '<div class="stat"><b>'+(v.avgStreak||0)+'</b><span>Avg streak</span></div>'+
+      '<div class="stat"><b>'+((t&&t.dhikr)||0).toLocaleString()+'</b><span>Dhikr counted</span></div>'+
+      '<div class="stat"><b>'+((t&&t.journal)||0).toLocaleString()+'</b><span>Reflections</span></div>'+
+    '</div>';
+}
+
+/* ── Retention: do signups stay? (cohort = week they joined) ── */
+function renderRetention(list){
+  var host=document.getElementById('retention'); if(!host) return;
+  if(!list || !list.length){ host.innerHTML='<div class="empty">No cohorts yet.</div>'; return; }
+  var any=list.some(function(c){return c.size>0;});
+  if(!any){ host.innerHTML='<div class="empty">No signups in the last 6 weeks yet.</div>'; return; }
+  host.innerHTML='<div class="cohorts">'+list.map(function(c,i){
+    var lbl=c.weeksAgo===0?'This week':(c.weeksAgo+'w ago');
+    var col=c.pct==null?'var(--dim)':(c.pct>=70?'#48d39a':(c.pct>=40?'var(--gold)':'#e0687f'));
+    var bg=c.pct==null?'var(--panel2)':'color-mix(in srgb,'+col+' 12%,var(--panel2))';
+    return '<div class="coh" style="animation-delay:'+(i*60)+'ms;background:'+bg+'">'+
+      '<div class="cp" style="color:'+col+'">'+(c.pct==null?'—':c.pct+'%')+'</div>'+
+      '<div class="cw">'+h(lbl)+'</div>'+
+      '<div class="cn">'+c.retained+'/'+c.size+' active</div></div>';
+  }).join('')+'</div>'+
+  '<div class="dim" style="font-size:12.5px;margin-top:13px">Share of each week\\'s signups that have synced in the last 14 days.</div>';
+}
 
 function areaChart(host, data, color){
   if(!host) return;
